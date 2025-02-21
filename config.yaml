@@ -1,8 +1,8 @@
 source:
+  type: mysql  # 或 cassandra
   hosts:
-    - "source-cassandra-host1:9042"
-    - "source-cassandra-host2:9042"
-  keyspace: "source_keyspace"
+    - "source-mysql-host:3306"  # MySQL 端口
+  database: "source_db"  # 对 MySQL 是数据库名，对 Cassandra 是 keyspace
   username: "source_user"
   password: "source_password"
   tables:
@@ -12,10 +12,10 @@ source:
     - name: "table3"
 
 destination:
+  type: mysql
   hosts:
-    - "dest-scylla-host1:9042"
-    - "dest-scylla-host2:9042"
-  keyspace: "dest_keyspace"
+    - "dest-mysql-host:3306"
+  database: "dest_db"
   username: "dest_user"
   password: "dest_password"
 

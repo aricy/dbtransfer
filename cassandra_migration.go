@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -20,19 +18,16 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-// 在文件开头添加版本常量
-const (
-	VERSION = "0.1"
-)
-
 type TableMapping struct {
 	Name       string `yaml:"name"`
 	TargetName string `yaml:"target_name,omitempty"`
 }
 
 type DBConfig struct {
+	Type     string         `yaml:"type"` // 数据库类型：cassandra 或 mysql
 	Hosts    []string       `yaml:"hosts"`
-	Keyspace string         `yaml:"keyspace"`
+	Keyspace string         `yaml:"keyspace"` // Cassandra 使用
+	Database string         `yaml:"database"` // MySQL 使用
 	Username string         `yaml:"username"`
 	Password string         `yaml:"password"`
 	Tables   []TableMapping `yaml:"tables,omitempty"`
@@ -76,7 +71,7 @@ func (s *MigrationStats) report() {
 		float64(s.ProcessedRows)/float64(s.TotalRows)*100, rate)
 }
 
-type Migration struct {
+type CassandraMigration struct {
 	source     *gocql.Session
 	dest       *gocql.Session
 	config     *Config
@@ -93,13 +88,7 @@ type TokenRange struct {
 	Complete bool              `json:"complete"`
 }
 
-type Checkpoint struct {
-	LastKey     map[string]string `json:"last_key"`
-	LastUpdated time.Time         `json:"last_updated"`
-	AllComplete bool              `json:"all_complete"`
-}
-
-func NewMigration(config *Config) (*Migration, error) {
+func NewCassandraMigration(config *Config) (*CassandraMigration, error) {
 	sourceCluster := createClusterConfig(config.Source)
 	destCluster := createClusterConfig(config.Destination)
 
@@ -117,7 +106,7 @@ func NewMigration(config *Config) (*Migration, error) {
 		return nil, fmt.Errorf("连接目标数据库失败: %v", err)
 	}
 
-	return &Migration{
+	return &CassandraMigration{
 		source:     sourceSession,
 		dest:       destSession,
 		config:     config,
@@ -128,7 +117,7 @@ func NewMigration(config *Config) (*Migration, error) {
 	}, nil
 }
 
-func (m *Migration) Close() {
+func (m *CassandraMigration) Close() {
 	if m.source != nil {
 		m.source.Close()
 	}
@@ -137,7 +126,7 @@ func (m *Migration) Close() {
 	}
 }
 
-func (m *Migration) Run(ctx context.Context) error {
+func (m *CassandraMigration) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(m.config.Source.Tables))
 
@@ -179,7 +168,7 @@ func (m *Migration) Run(ctx context.Context) error {
 	return nil
 }
 
-func (m *Migration) migrateTable(ctx context.Context, table TableMapping) error {
+func (m *CassandraMigration) migrateTable(ctx context.Context, table TableMapping) error {
 	// 首先检查表是否存在
 	keyspace := m.config.Source.Keyspace
 	tableExistsQuery := fmt.Sprintf(`
@@ -203,7 +192,7 @@ func (m *Migration) migrateTable(ctx context.Context, table TableMapping) error 
 	checkpoint, err := m.loadCheckpoint(table.Name)
 	if err != nil {
 		logrus.Infof("加载断点信息失败: %v, 将从头开始迁移", err)
-	} else if checkpoint != nil && checkpoint.AllComplete {
+	} else if checkpoint != nil && checkpoint.Complete {
 		logrus.Infof("表 %s 已完成迁移，跳过", table.Name)
 		return nil
 	}
@@ -237,7 +226,7 @@ func (m *Migration) migrateTable(ctx context.Context, table TableMapping) error 
 	return m.copyData(ctx, table.Name, targetName, checkpoint)
 }
 
-func (m *Migration) migrateDependencies() error {
+func (m *CassandraMigration) migrateDependencies() error {
 	// 获取自定义类型
 	typeQuery := fmt.Sprintf(`
 		SELECT type_name, field_names, field_types 
@@ -339,9 +328,9 @@ func buildTypeFields(names, types []string) string {
 	return strings.Join(fields, ", ")
 }
 
-func (m *Migration) copyData(ctx context.Context, sourceName, targetName string, checkpoint *Checkpoint) error {
+func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetName string, checkpoint *Checkpoint) error {
 	// 在开始处检查完成标记
-	if checkpoint != nil && checkpoint.AllComplete {
+	if checkpoint != nil && checkpoint.Complete {
 		logrus.Infof("表 %s 已完成迁移，跳过执行", sourceName)
 		return nil
 	}
@@ -435,7 +424,7 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 	logrus.Infof("完整查询语句: %s", query)
 
 	// 只处理断点续传的位置
-	if checkpoint != nil && len(checkpoint.LastKey) > 0 && !checkpoint.AllComplete {
+	if checkpoint != nil && len(checkpoint.LastKey) > 0 && !checkpoint.Complete {
 		whereClause := m.buildWhereClause(columnTypes, sourceName)
 		if whereClause != "" {
 			query = fmt.Sprintf("%s WHERE %s", query, whereClause)
@@ -569,7 +558,7 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 		for range checkpointTicker.C {
 			m.stats.mu.Lock()
 			if lastProcessedKey != nil {
-				if err := m.saveCheckpoint(sourceName, lastProcessedKey); err != nil {
+				if err := m.saveCheckpoint(sourceName, lastProcessedKey, false); err != nil {
 					logrus.Errorf("保存断点失败: %v", err)
 				} else {
 					logrus.Infof("保存断点成功，位置: %+v", lastProcessedKey)
@@ -721,7 +710,7 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 	}
 	completionKey["completed"] = "true"
 
-	if err := m.saveCheckpoint(sourceName, completionKey); err != nil {
+	if err := m.saveCheckpoint(sourceName, completionKey, true); err != nil {
 		logrus.Errorf("保存完成标记失败: %v", err)
 		return fmt.Errorf("保存完成标记失败: %v", err)
 	}
@@ -730,7 +719,7 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 	return nil
 }
 
-func (m *Migration) executeBatchWithRetry(batch *gocql.Batch) error {
+func (m *CassandraMigration) executeBatchWithRetry(batch *gocql.Batch) error {
 	var lastErr error
 	for i := 0; i < m.maxRetries; i++ {
 		if err := m.dest.ExecuteBatch(batch); err != nil {
@@ -743,7 +732,7 @@ func (m *Migration) executeBatchWithRetry(batch *gocql.Batch) error {
 	return fmt.Errorf("执行批量写入失败，重试%d次后仍然失败: %v", m.maxRetries, lastErr)
 }
 
-func (m *Migration) getTableSchema(tableName string) (string, error) {
+func (m *CassandraMigration) getTableSchema(tableName string) (string, error) {
 	keyspace := m.config.Source.Keyspace
 
 	// 获取表的列信息
@@ -825,7 +814,7 @@ func (m *Migration) getTableSchema(tableName string) (string, error) {
 	return createTable, nil
 }
 
-func (m *Migration) buildInsertQuery(tableName string, columnNames []string) string {
+func (m *CassandraMigration) buildInsertQuery(tableName string, columnNames []string) string {
 	placeholders := make([]string, len(columnNames))
 	for i := range columnNames {
 		placeholders[i] = "?"
@@ -839,22 +828,22 @@ func (m *Migration) buildInsertQuery(tableName string, columnNames []string) str
 	return query
 }
 
-func (m *Migration) loadCheckpoint(tableName string) (*Checkpoint, error) {
+func (m *CassandraMigration) loadCheckpoint(tableName string) (*Checkpoint, error) {
 	checkpoint, err := m.loadCheckpointFile(tableName)
 	if err != nil {
 		return nil, err
 	}
 
 	// 如果发现完成标记，返回带完成标记的 checkpoint
-	if checkpoint != nil && checkpoint.AllComplete {
+	if checkpoint != nil && checkpoint.Complete {
 		logrus.Infof("表 %s 已完成迁移，跳过", tableName)
-		return checkpoint, nil // 返回 checkpoint 而不是 nil
+		return checkpoint, nil
 	}
 
 	return checkpoint, nil
 }
 
-func (m *Migration) loadCheckpointFile(tableName string) (*Checkpoint, error) {
+func (m *CassandraMigration) loadCheckpointFile(tableName string) (*Checkpoint, error) {
 	if m.config.Migration.CheckpointDir == "" {
 		return nil, nil
 	}
@@ -878,29 +867,16 @@ func (m *Migration) loadCheckpointFile(tableName string) (*Checkpoint, error) {
 	return &checkpoint, nil
 }
 
-func (m *Migration) saveCheckpoint(tableName string, lastKey map[string]string) error {
+func (m *CassandraMigration) saveCheckpoint(tableName string, lastKey map[string]string, completed bool) error {
 	if m.config.Migration.CheckpointDir == "" {
 		return nil
 	}
 
-	// 加载现有的checkpoint
-	checkpoint, _ := m.loadCheckpoint(tableName)
-	if checkpoint == nil {
-		logrus.Infof("创建新的checkpoint")
-		checkpoint = &Checkpoint{
-			LastKey:     make(map[string]string),
-			LastUpdated: time.Now(),
-			AllComplete: false,
-		}
+	checkpoint := &Checkpoint{
+		LastKey:     lastKey,
+		LastUpdated: time.Now(),
+		Complete:    completed,
 	}
-
-	// 更新断点信息
-	if len(lastKey) > 0 {
-		logrus.Infof("更新断点位置，lastKey: %+v", lastKey)
-		checkpoint.LastKey = lastKey
-	}
-
-	checkpoint.LastUpdated = time.Now()
 
 	data, err := json.Marshal(checkpoint)
 	if err != nil {
@@ -914,7 +890,7 @@ func (m *Migration) saveCheckpoint(tableName string, lastKey map[string]string) 
 	return os.WriteFile(filename, data, 0644)
 }
 
-func (m *Migration) buildWhereClause(columnTypes map[string]string, tableName string) string {
+func (m *CassandraMigration) buildWhereClause(columnTypes map[string]string, tableName string) string {
 	// 加载断点信息
 	checkpoint, err := m.loadCheckpoint(tableName)
 	if err != nil || checkpoint == nil || len(checkpoint.LastKey) == 0 {
@@ -1014,127 +990,4 @@ func createClusterConfig(dbConfig DBConfig) *gocql.ClusterConfig {
 		Password: dbConfig.Password,
 	}
 	return cluster
-}
-
-// 添加自定义格式器
-type customFormatter struct {
-	logrus.TextFormatter
-}
-
-// 定义日志级别的颜色代码
-var levelColors = map[logrus.Level]string{
-	logrus.DebugLevel: "\033[36m", // 青色
-	logrus.InfoLevel:  "\033[32m", // 绿色
-	logrus.WarnLevel:  "\033[33m", // 黄色
-	logrus.ErrorLevel: "\033[31m", // 红色
-	logrus.FatalLevel: "\033[35m", // 紫色
-	logrus.PanicLevel: "\033[31m", // 红色
-}
-
-// 定义颜色重置代码
-const colorReset = "\033[0m"
-
-func (f *customFormatter) Format(entry *logrus.Entry) ([]byte, error) {
-	// 获取时间戳
-	timestamp := entry.Time.Format("2006-01-02 15:04:05")
-
-	// 获取日志级别（大写，固定4位宽度）
-	levelText := strings.ToUpper(entry.Level.String())
-	for len(levelText) < 4 {
-		levelText += " "
-	}
-	if len(levelText) > 4 {
-		levelText = levelText[:4]
-	}
-
-	// 获取颜色代码
-	color := levelColors[entry.Level]
-
-	// 构建日志消息（带颜色）
-	msg := fmt.Sprintf("%s[%s] %s%s%s%s\n",
-		color,
-		timestamp,
-		levelText,
-		colorReset,
-		" ", // 添加一个空格作为分隔符
-		entry.Message)
-
-	return []byte(msg), nil
-}
-
-func main() {
-	// 添加版本标志
-	var showVersion bool
-	flag.BoolVar(&showVersion, "version", false, "显示版本信息")
-	configFile := flag.String("config", "config.yaml", "配置文件路径")
-	flag.Parse()
-
-	// 如果指定了 version 标志，显示版本信息并退出
-	if showVersion {
-		fmt.Printf("DB Migration Tool v%s\n", VERSION)
-		os.Exit(0)
-	}
-
-	// 设置日志格式
-	logrus.SetFormatter(&customFormatter{
-		TextFormatter: logrus.TextFormatter{
-			FullTimestamp:   true,
-			TimestampFormat: "2006-01-02 15:04:05",
-		},
-	})
-
-	// 加载配置
-	config, err := loadConfig(*configFile)
-	if err != nil {
-		logrus.Fatalf("加载配置失败: %v", err)
-	}
-
-	// 设置日志级别
-	logLevel := strings.ToLower(config.Migration.LogLevel)
-	switch logLevel {
-	case "debug":
-		logrus.SetLevel(logrus.DebugLevel)
-	case "info":
-		logrus.SetLevel(logrus.InfoLevel)
-	case "warn", "warning":
-		logrus.SetLevel(logrus.WarnLevel)
-	case "error":
-		logrus.SetLevel(logrus.ErrorLevel)
-	default:
-		// 如果配置文件中没有指定或值无效，则使用环境变量
-		if os.Getenv("DEBUG") != "" {
-			logrus.SetLevel(logrus.DebugLevel)
-		} else {
-			logrus.SetLevel(logrus.InfoLevel)
-		}
-	}
-
-	// 设置日志输出
-	if config.Migration.LogFile != "" {
-		logFile, err := os.OpenFile(config.Migration.LogFile,
-			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			logrus.Fatalf("打开日志文件失败: %v", err)
-		}
-		defer logFile.Close()
-
-		// 同时输出到文件和标准输出
-		multiWriter := io.MultiWriter(os.Stdout, logFile)
-		logrus.SetOutput(multiWriter)
-	}
-
-	migration, err := NewMigration(config)
-	if err != nil {
-		logrus.Fatalf("初始化迁移失败: %v", err)
-	}
-	defer migration.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	if err := migration.Run(ctx); err != nil {
-		logrus.Fatalf("迁移失败: %v", err)
-	}
-
-	logrus.Info("迁移完成")
 }
