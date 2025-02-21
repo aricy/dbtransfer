@@ -20,6 +20,11 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+// 在文件开头添加版本常量
+const (
+	VERSION = "0.1"
+)
+
 type TableMapping struct {
 	Name       string `yaml:"name"`
 	TargetName string `yaml:"target_name,omitempty"`
@@ -1058,14 +1063,30 @@ func (f *customFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 }
 
 func main() {
-	// 添加命令行参数
+	// 添加版本标志
+	var showVersion bool
+	flag.BoolVar(&showVersion, "version", false, "显示版本信息")
 	configFile := flag.String("config", "config.yaml", "配置文件路径")
 	flag.Parse()
 
-	// 加载配置文件
+	// 如果指定了 version 标志，显示版本信息并退出
+	if showVersion {
+		fmt.Printf("DB Migration Tool v%s\n", VERSION)
+		os.Exit(0)
+	}
+
+	// 设置日志格式
+	logrus.SetFormatter(&customFormatter{
+		TextFormatter: logrus.TextFormatter{
+			FullTimestamp:   true,
+			TimestampFormat: "2006-01-02 15:04:05",
+		},
+	})
+
+	// 加载配置
 	config, err := loadConfig(*configFile)
 	if err != nil {
-		logrus.Fatalf("加载配置文件 %s 失败: %v", *configFile, err)
+		logrus.Fatalf("加载配置失败: %v", err)
 	}
 
 	// 设置日志级别
@@ -1101,14 +1122,6 @@ func main() {
 		multiWriter := io.MultiWriter(os.Stdout, logFile)
 		logrus.SetOutput(multiWriter)
 	}
-
-	// 设置自定义日志格式
-	logrus.SetFormatter(&customFormatter{
-		TextFormatter: logrus.TextFormatter{
-			DisableColors:   false, // 启用颜色
-			TimestampFormat: "2006-01-02 15:04:05",
-		},
-	})
 
 	migration, err := NewMigration(config)
 	if err != nil {
