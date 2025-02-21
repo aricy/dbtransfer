@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -79,9 +80,17 @@ type Migration struct {
 	retryDelay time.Duration
 }
 
+type TokenRange struct {
+	Start    int64             `json:"start"`
+	End      int64             `json:"end"`
+	LastKey  map[string]string `json:"last_key,omitempty"`
+	Complete bool              `json:"complete"`
+}
+
 type Checkpoint struct {
-	LastKey     map[string]string
-	LastUpdated time.Time
+	LastKey     map[string]string `json:"last_key"`
+	LastUpdated time.Time         `json:"last_updated"`
+	AllComplete bool              `json:"all_complete"`
 }
 
 func NewMigration(config *Config) (*Migration, error) {
@@ -188,7 +197,7 @@ func (m *Migration) migrateTable(ctx context.Context, table TableMapping) error 
 	checkpoint, err := m.loadCheckpoint(table.Name)
 	if err != nil {
 		logrus.Infof("加载断点信息失败: %v, 将从头开始迁移", err)
-	} else if checkpoint != nil && checkpoint.LastKey["completed"] == "true" {
+	} else if checkpoint != nil && checkpoint.AllComplete {
 		logrus.Infof("表 %s 已完成迁移，跳过", table.Name)
 		return nil
 	}
@@ -326,7 +335,7 @@ func buildTypeFields(names, types []string) string {
 
 func (m *Migration) copyData(ctx context.Context, sourceName, targetName string, checkpoint *Checkpoint) error {
 	// 在开始处检查完成标记
-	if checkpoint != nil && checkpoint.LastKey["completed"] == "true" {
+	if checkpoint != nil && checkpoint.AllComplete {
 		logrus.Infof("表 %s 已完成迁移，跳过执行", sourceName)
 		return nil
 	}
@@ -390,44 +399,28 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 		return fmt.Errorf("获取主键信息失败: %v", err)
 	}
 
-	// 构建查询部分
-	var queryParts []string
-	var ttlParts []string
+	// 构建查询，包括每列的 TTL（除了主键列）
+	queryParts := make([]string, 0, len(columns))
 	for _, col := range columns {
-		colName := col.Name
-		queryParts = append(queryParts, colName)
-
-		if !pkMap[colName] {
-			colType := columnTypes[colName]
-			if !strings.Contains(colType, "list") &&
-				!strings.Contains(colType, "set") &&
-				!strings.Contains(colType, "map") &&
-				!strings.Contains(colType, "frozen") {
-				ttlParts = append(ttlParts, fmt.Sprintf("TTL(%s)", colName))
-				logrus.Debugf("TTL列: %s (%s)", colName, colType)
-			} else {
-				logrus.Debugf("跳过TTL: %s (%s)", colName, colType)
-			}
+		if pkMap[col.Name] {
+			// 主键列不需要 TTL
+			queryParts = append(queryParts, col.Name)
+		} else {
+			// 非主键列添加 TTL
+			queryParts = append(queryParts, fmt.Sprintf("%s, TTL(%s)", col.Name, col.Name))
 		}
 	}
 
-	// 构建完整查询
-	query := fmt.Sprintf("SELECT %s%s FROM %s.%s",
+	query := fmt.Sprintf("SELECT %s FROM %s.%s",
 		strings.Join(queryParts, ", "),
-		func() string {
-			if len(ttlParts) > 0 {
-				return ", " + strings.Join(ttlParts, ", ")
-			}
-			return ""
-		}(),
-		keyspace,
+		m.config.Source.Keyspace,
 		sourceName)
 
 	logrus.Infof("完整查询语句: %s", query)
 
 	// 只处理断点续传的位置
-	if checkpoint != nil && len(checkpoint.LastKey) > 0 && checkpoint.LastKey["completed"] != "true" {
-		whereClause := m.buildWhereClause(checkpoint.LastKey, columnTypes, sourceName)
+	if checkpoint != nil && len(checkpoint.LastKey) > 0 && !checkpoint.AllComplete {
+		whereClause := m.buildWhereClause(columnTypes, sourceName)
 		if whereClause != "" {
 			query = fmt.Sprintf("%s WHERE %s", query, whereClause)
 			logrus.Infof("从断点继续: %s", whereClause)
@@ -435,28 +428,23 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 	}
 
 	// 为所有列创建值存储（包括TTL列）
-	totalColumns := len(queryParts) + len(ttlParts)
-	values := make([]interface{}, totalColumns)
-	valuePointers := make([]interface{}, totalColumns)
+	values := make([]interface{}, len(columns))             // 只存储列值
+	ttlValues := make([]interface{}, len(columns))          // 存储TTL值
+	valuePointers := make([]interface{}, 0, len(columns)*2) // 存储所有指针
 
 	// 根据列类型创建正确的接收器
 	for i, col := range columns {
 		colType := columnTypes[col.Name]
 		switch {
 		case strings.Contains(colType, "list<frozen<"):
-			// 处理包含 frozen 类型的列表
 			values[i] = &[]map[string]interface{}{}
 		case strings.Contains(colType, "frozen<"):
-			// 处理 frozen 类型
 			values[i] = &map[string]interface{}{}
 		case strings.Contains(colType, "list<"):
-			// 处理普通列表
 			values[i] = &[]interface{}{}
 		case strings.Contains(colType, "map<"):
-			// 处理 map 类型
 			values[i] = &map[string]interface{}{}
 		case strings.Contains(colType, "set<"):
-			// 处理 set 类型
 			values[i] = &[]interface{}{}
 		case colType == "blob":
 			values[i] = &[]byte{}
@@ -469,31 +457,71 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 		default:
 			values[i] = new(string)
 		}
-		valuePointers[i] = values[i]
+
+		// 添加列值指针
+		valuePointers = append(valuePointers, values[i])
+
+		// 如果不是主键列，添加TTL值指针
+		if !pkMap[col.Name] {
+			ttlValues[i] = new(int)
+			valuePointers = append(valuePointers, ttlValues[i])
+		}
+
 		logrus.Debugf("列 %s (类型: %s) 使用接收器类型: %T", col.Name, colType, values[i])
 	}
 
 	// TTL 列使用 int 类型
-	for i := len(columns); i < totalColumns; i++ {
+	for i := len(columns); i < len(values); i++ {
 		values[i] = new(int)
-		valuePointers[i] = values[i]
+		valuePointers = append(valuePointers, values[i])
 	}
 
 	logrus.Infof("总列数: %d (数据列: %d, TTL列: %d)",
-		totalColumns, len(queryParts), len(ttlParts))
+		len(values), len(queryParts), len(queryParts))
 
 	// 执行数据查询
 	logrus.Infof("开始执行数据查询，批次大小: %d", m.config.Migration.BatchSize)
 	dataIter := m.source.Query(query).PageSize(m.config.Migration.BatchSize).Iter()
 	defer dataIter.Close()
 
-	// 构建插入语句
-	columnNames := make([]string, len(columns))
+	// 构建插入语句，支持每列的 TTL
+	insertParts := make([]string, len(columns))
+	placeholders := make([]string, len(columns))
+	ttlCount := 0
 	for i, col := range columns {
-		columnNames[i] = col.Name
+		insertParts[i] = col.Name
+		if pkMap[col.Name] {
+			// 主键列不需要TTL
+			placeholders[i] = "?"
+		} else {
+			// 非主键列需要TTL
+			placeholders[i] = "?"
+			ttlCount++
+		}
 	}
-	insertQuery := m.buildInsertQuery(targetName, columnNames)
 
+	// 构建基本的插入语句
+	insertQuery := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+		targetName,
+		strings.Join(insertParts, ", "),
+		strings.Join(placeholders, ", "))
+
+	// 为非主键列添加 TTL 子句
+	ttlClauses := make([]string, 0)
+	for _, col := range columns {
+		if !pkMap[col.Name] {
+			ttlClauses = append(ttlClauses, fmt.Sprintf("TTL ?"))
+		}
+	}
+
+	if len(ttlClauses) > 0 {
+		insertQuery += " USING " + strings.Join(ttlClauses, " AND ")
+	}
+
+	logrus.Debugf("插入语句: %s", insertQuery)
+	logrus.Debugf("列数: %d, 主键列数: %d, TTL列数: %d", len(columns), len(columns)-ttlCount, ttlCount)
+
+	// 处理数据
 	batch := m.dest.NewBatch(gocql.UnloggedBatch)
 	count := 0
 	rowCount := 0
@@ -531,21 +559,49 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 		}
 
 		// 提取数据值
-		dataValues := make([]interface{}, len(columns))
-		for i := 0; i < len(columns); i++ {
-			dataValues[i] = values[i]
+		dataValues := make([]interface{}, len(columns)+ttlCount) // 调整大小为列数+TTL数
+		valueIndex := 0
+		for i := range columns { // 只使用索引
+			// 所有列都需要值
+			dataValues[valueIndex] = values[i]
+			valueIndex++
 		}
+
+		// 添加TTL值
+		for i := range columns { // 只使用索引
+			if !pkMap[columns[i].Name] {
+				dataValues[valueIndex] = ttlValues[i]
+				valueIndex++
+			}
+		}
+
 
 		// 更新最后处理的位置
 		currentKey := make(map[string]string)
 		for i, col := range columns {
 			if pkMap[col.Name] {
-				if columnTypes[col.Name] == "blob" {
-					if bytePtr, ok := values[i].(*[]byte); ok {
-						currentKey[col.Name] = string(*bytePtr)
+				switch v := values[i].(type) {
+				case *string:
+					if v != nil {
+						currentKey[col.Name] = *v
 					}
-				} else {
-					currentKey[col.Name] = fmt.Sprintf("%v", values[i])
+				case *[]byte:
+					if v != nil {
+						currentKey[col.Name] = string(*v)
+					}
+				case *int:
+					if v != nil {
+						currentKey[col.Name] = fmt.Sprintf("%d", *v)
+					}
+				case *int64:
+					if v != nil {
+						currentKey[col.Name] = fmt.Sprintf("%d", *v)
+					}
+				default:
+					// 对于其他类型，先解引用再转换
+					if v != nil {
+						currentKey[col.Name] = fmt.Sprintf("%v", reflect.ValueOf(v).Elem().Interface())
+					}
 				}
 			}
 		}
@@ -567,30 +623,33 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 		}
 	}
 
+	// 处理最后一批数据
+	if count > 0 {
+		if err := m.executeBatchWithRetry(batch); err != nil {
+			return err
+		}
+		m.stats.increment(count)
+	}
+
+	// 如果迭代器没有错误，说明已经处理完所有数据，标记为完成
 	if err := dataIter.Close(); err != nil {
 		return fmt.Errorf("查询执行失败: %v", err)
 	}
 
-	// 如果没有新数据，标记为完成
-	if rowCount == 0 {
-		logrus.Infof("表 %s 没有新数据需要迁移，标记为完成", sourceName)
-		lastKey := make(map[string]string)
-		if checkpoint != nil {
-			for k, v := range checkpoint.LastKey {
-				lastKey[k] = v
-			}
-		}
-		lastKey["completed"] = "true"
+	// 标记为完成
+	logrus.Infof("表 %s 迁移完成，标记为完成状态", sourceName)
+	completionKey := make(map[string]string)
+	for k, v := range lastProcessedKey {
+		completionKey[k] = v
+	}
+	completionKey["completed"] = "true"
 
-		lastCheckpoint := &Checkpoint{
-			LastKey: lastKey,
-		}
-
-		if err := m.saveCheckpoint(sourceName, lastCheckpoint.LastKey); err != nil {
-			logrus.Errorf("保存完成断点失败: %v", err)
-		}
+	if err := m.saveCheckpoint(sourceName, completionKey); err != nil {
+		logrus.Errorf("保存完成标记失败: %v", err)
+		return fmt.Errorf("保存完成标记失败: %v", err)
 	}
 
+	logrus.Infof("表 %s 迁移完成并已保存完成标记", sourceName)
 	return nil
 }
 
@@ -644,6 +703,18 @@ func (m *Migration) getTableSchema(tableName string) (string, error) {
 		return "", fmt.Errorf("未找到表 %s 的结构信息", tableName)
 	}
 
+	// 获取表的属性，包括默认 TTL
+	tableQuery := fmt.Sprintf(`
+		SELECT default_time_to_live
+		FROM system_schema.tables
+		WHERE keyspace_name = '%s' AND table_name = '%s'`,
+		keyspace, tableName)
+
+	var defaultTTL int
+	if err := m.source.Query(tableQuery).Scan(&defaultTTL); err != nil {
+		logrus.Warnf("获取表默认TTL失败: %v", err)
+	}
+
 	// 构建主键约束
 	var constraints []string
 	if len(pkColumns) > 0 {
@@ -658,12 +729,18 @@ func (m *Migration) getTableSchema(tableName string) (string, error) {
 	}
 
 	// 构建完整的CREATE TABLE语句
-	createTable := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n    %s%s\n)",
+	createTable := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n    %s%s\n)%s",
 		tableName,
 		strings.Join(columns, ",\n    "),
 		func() string {
 			if len(constraints) > 0 {
 				return ",\n    " + strings.Join(constraints, ",\n    ")
+			}
+			return ""
+		}(),
+		func() string {
+			if defaultTTL > 0 {
+				return fmt.Sprintf(" WITH default_time_to_live = %d", defaultTTL)
 			}
 			return ""
 		}())
@@ -692,7 +769,7 @@ func (m *Migration) loadCheckpoint(tableName string) (*Checkpoint, error) {
 	}
 
 	// 如果发现完成标记，返回带完成标记的 checkpoint
-	if checkpoint != nil && checkpoint.LastKey["completed"] == "true" {
+	if checkpoint != nil && checkpoint.AllComplete {
 		logrus.Infof("表 %s 已完成迁移，跳过", tableName)
 		return checkpoint, nil // 返回 checkpoint 而不是 nil
 	}
@@ -729,10 +806,26 @@ func (m *Migration) saveCheckpoint(tableName string, lastKey map[string]string) 
 		return nil
 	}
 
-	data, err := json.Marshal(map[string]interface{}{
-		"LastKey":     lastKey,
-		"LastUpdated": time.Now(),
-	})
+	// 加载现有的checkpoint
+	checkpoint, _ := m.loadCheckpoint(tableName)
+	if checkpoint == nil {
+		logrus.Infof("创建新的checkpoint")
+		checkpoint = &Checkpoint{
+			LastKey:     make(map[string]string),
+			LastUpdated: time.Now(),
+			AllComplete: false,
+		}
+	}
+
+	// 更新断点信息
+	if len(lastKey) > 0 {
+		logrus.Infof("更新断点位置，lastKey: %+v", lastKey)
+		checkpoint.LastKey = lastKey
+	}
+
+	checkpoint.LastUpdated = time.Now()
+
+	data, err := json.Marshal(checkpoint)
 	if err != nil {
 		return err
 	}
@@ -740,39 +833,31 @@ func (m *Migration) saveCheckpoint(tableName string, lastKey map[string]string) 
 	filename := filepath.Join(m.config.Migration.CheckpointDir,
 		fmt.Sprintf("%s.checkpoint", tableName))
 
-	logrus.Infof("保存断点 %s, 最后更新时间: %v", tableName, time.Now())
+	logrus.Infof("保存断点到文件 %s，checkpoint内容: %+v", filename, checkpoint)
 	return os.WriteFile(filename, data, 0644)
 }
 
-func (m *Migration) buildWhereClause(lastKey map[string]string, columnTypes map[string]string, tableName string) string {
-	// 获取分区键和聚类键的顺序及排序方向
-	var partitionKeys, clusteringKeys []string
-	var clusteringOrders = make(map[string]string)
+func (m *Migration) buildWhereClause(columnTypes map[string]string, tableName string) string {
+	// 获取分区键
+	var partitionKeys []string
 
-	// 获取列信息，包括聚类键的排序方向
+	// 获取列信息
 	colQuery := fmt.Sprintf(`
-		SELECT column_name, kind, clustering_order
+		SELECT column_name, kind
 		FROM system_schema.columns 
 		WHERE keyspace_name = '%s' 
 		AND table_name = '%s'`,
 		m.config.Source.Keyspace,
 		tableName)
 
-	logrus.Infof("执行列信息查询: %s", colQuery)
+	logrus.Infof("执行列信息查询:\n%s", colQuery)
 	iter := m.source.Query(colQuery).Iter()
-	var colName, kind, order string
-	for iter.Scan(&colName, &kind, &order) {
+	var colName, kind string
+
+	for iter.Scan(&colName, &kind) {
 		if kind == "partition_key" {
 			logrus.Debugf("找到分区键: %s", colName)
 			partitionKeys = append(partitionKeys, colName)
-		} else if kind == "clustering" {
-			logrus.Debugf("找到聚类键: %s (排序: %s)", colName, order)
-			clusteringKeys = append(clusteringKeys, colName)
-			if order == "desc" {
-				clusteringOrders[colName] = "DESC"
-			} else {
-				clusteringOrders[colName] = "ASC"
-			}
 		}
 	}
 	iter.Close()
@@ -782,42 +867,38 @@ func (m *Migration) buildWhereClause(lastKey map[string]string, columnTypes map[
 		return ""
 	}
 
-	// 打印断点信息
-	logrus.Infof("当前断点信息:")
-	for k, v := range lastKey {
-		logrus.Infof("  %s = %v", k, v)
+	// 加载断点信息
+	checkpoint, err := m.loadCheckpoint(tableName)
+	if err != nil {
+		logrus.Warnf("加载断点失败: %v, 将从头开始", err)
+		return ""
 	}
 
-	// 只使用分区键构建 token 查询
-	var tokenParts []string
-	var tokenValues []string
-	for _, col := range partitionKeys {
-		if val, ok := lastKey[col]; ok {
-			tokenParts = append(tokenParts, col)
-			switch columnTypes[col] {
-			case "blob":
-				tokenValues = append(tokenValues, fmt.Sprintf("0x%x", []byte(val)))
-			case "bigint", "int", "varint":
-				tokenValues = append(tokenValues, val)
-			default:
-				tokenValues = append(tokenValues, fmt.Sprintf("'%s'", val))
+	// 如果有断点信息，只使用分区键构建条件
+	if checkpoint != nil && len(checkpoint.LastKey) > 0 {
+		// 检查是否所有分区键都存在
+		allPartitionKeysPresent := true
+		partitionKeyValues := make([]string, len(partitionKeys))
+		for i, key := range partitionKeys {
+			if val, ok := checkpoint.LastKey[key]; ok {
+				partitionKeyValues[i] = fmt.Sprintf("'%s'", val)
+			} else {
+				allPartitionKeysPresent = false
+				break
 			}
-			logrus.Infof("使用断点值: %s = %v", col, val)
 		}
-	}
 
-	// 只构建 token 查询条件
-	if len(tokenParts) > 0 {
-		whereClause := fmt.Sprintf("token(%s) > token(%s)",
-			strings.Join(partitionKeys, ", "),
-			strings.Join(tokenValues, ", "))
+		if allPartitionKeysPresent {
+			// 构建 token 条件，包含所有分区键
+			whereClause := fmt.Sprintf("token(%s) >= token(%s)",
+				strings.Join(partitionKeys, ", "),
+				strings.Join(partitionKeyValues, ", "))
 
-		logrus.Infof("断点续传条件:\n  分区键: %v\n  聚类键: %v\n  完整条件: %s",
-			partitionKeys,
-			clusteringKeys,
-			whereClause)
-
-		return whereClause
+			logrus.Infof("断点续传条件:\n  分区键: %v\n  完整条件: %s",
+				partitionKeys,
+				whereClause)
+			return whereClause
+		}
 	}
 
 	return ""
