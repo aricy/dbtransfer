@@ -23,15 +23,6 @@ type TableMapping struct {
 	TargetName string `yaml:"target_name,omitempty"`
 }
 
-type DBConfig struct {
-	Type     string         `yaml:"type"` // 数据库类型：cassandra 或 mysql
-	Hosts    []string       `yaml:"hosts"`
-	Keyspace string         `yaml:"keyspace"` // Cassandra 使用
-	Database string         `yaml:"database"` // MySQL 使用
-	Username string         `yaml:"username"`
-	Password string         `yaml:"password"`
-	Tables   []TableMapping `yaml:"tables,omitempty"`
-}
 
 type MigrationConfig struct {
 	BatchSize       int    `yaml:"batch_size"`

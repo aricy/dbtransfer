@@ -29,10 +29,6 @@ type MySQLMigration struct {
 }
 
 func NewMySQLMigration(config *Config) (*MySQLMigration, error) {
-	if config.Source.Type != "mysql" || config.Destination.Type != "mysql" {
-		return nil, fmt.Errorf("源或目标数据库类型不是 MySQL")
-	}
-
 	// 连接源数据库
 	sourceDB, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s",
 		config.Source.Username,
