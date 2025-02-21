@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -374,7 +375,7 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 
 	logrus.Infof("成功获取到 %d 个列", len(columns))
 
-	// 获取主键列信息
+	// 获取主键列信息，特别标记分区键
 	pkQuery := fmt.Sprintf(`
 		SELECT column_name, kind 
 		FROM system_schema.columns 
@@ -387,10 +388,15 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 	pkIter := m.source.Query(pkQuery).Iter()
 	var colName, kind string
 	pkMap := make(map[string]bool)
+	partitionKeys := make(map[string]bool) // 新增：专门记录分区键
 
 	for pkIter.Scan(&colName, &kind) {
-		if kind == "partition_key" || kind == "clustering" {
-			logrus.Debugf("主键列: %s (%s)", colName, kind)
+		if kind == "partition_key" {
+			logrus.Debugf("分区键: %s", colName)
+			pkMap[colName] = true
+			partitionKeys[colName] = true
+		} else if kind == "clustering" {
+			logrus.Debugf("聚集键: %s", colName)
 			pkMap[colName] = true
 		}
 	}
@@ -399,14 +405,19 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 		return fmt.Errorf("获取主键信息失败: %v", err)
 	}
 
-	// 构建查询，包括每列的 TTL（除了主键列）
+	// 构建查询，包括每列的 TTL（除了主键列和集合类型列）
 	queryParts := make([]string, 0, len(columns))
 	for _, col := range columns {
-		if pkMap[col.Name] {
-			// 主键列不需要 TTL
+		colType := columnTypes[col.Name]
+		isCollection := strings.Contains(colType, "list<") ||
+			strings.Contains(colType, "map<") ||
+			strings.Contains(colType, "set<")
+
+		if pkMap[col.Name] || isCollection {
+			// 主键列和集合类型不需要 TTL
 			queryParts = append(queryParts, col.Name)
 		} else {
-			// 非主键列添加 TTL
+			// 非主键且非集合类型的列添加 TTL
 			queryParts = append(queryParts, fmt.Sprintf("%s, TTL(%s)", col.Name, col.Name))
 		}
 	}
@@ -461,19 +472,17 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 		// 添加列值指针
 		valuePointers = append(valuePointers, values[i])
 
-		// 如果不是主键列，添加TTL值指针
-		if !pkMap[col.Name] {
+		// 只为非主键且非集合类型的列添加TTL值指针
+		isCollection := strings.Contains(colType, "list<") ||
+			strings.Contains(colType, "map<") ||
+			strings.Contains(colType, "set<")
+
+		if !pkMap[col.Name] && !isCollection {
 			ttlValues[i] = new(int)
 			valuePointers = append(valuePointers, ttlValues[i])
 		}
 
 		logrus.Debugf("列 %s (类型: %s) 使用接收器类型: %T", col.Name, colType, values[i])
-	}
-
-	// TTL 列使用 int 类型
-	for i := len(columns); i < len(values); i++ {
-		values[i] = new(int)
-		valuePointers = append(valuePointers, values[i])
 	}
 
 	logrus.Infof("总列数: %d (数据列: %d, TTL列: %d)",
@@ -489,13 +498,16 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 	placeholders := make([]string, len(columns))
 	ttlCount := 0
 	for i, col := range columns {
+		colType := columnTypes[col.Name]
+		isCollection := strings.Contains(colType, "list<") ||
+			strings.Contains(colType, "map<") ||
+			strings.Contains(colType, "set<")
+
 		insertParts[i] = col.Name
-		if pkMap[col.Name] {
-			// 主键列不需要TTL
-			placeholders[i] = "?"
-		} else {
-			// 非主键列需要TTL
-			placeholders[i] = "?"
+		placeholders[i] = "?"
+
+		// 只计算非主键且非集合类型的列
+		if !pkMap[col.Name] && !isCollection {
 			ttlCount++
 		}
 	}
@@ -506,16 +518,27 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 		strings.Join(insertParts, ", "),
 		strings.Join(placeholders, ", "))
 
-	// 为非主键列添加 TTL 子句
-	ttlClauses := make([]string, 0)
-	for _, col := range columns {
-		if !pkMap[col.Name] {
-			ttlClauses = append(ttlClauses, fmt.Sprintf("TTL ?"))
-		}
-	}
+	// 创建数据值数组
+	var dataValues []interface{}
 
-	if len(ttlClauses) > 0 {
-		insertQuery += " USING " + strings.Join(ttlClauses, " AND ")
+	// 只有在有非主键列时才添加 TTL 子句
+	if ttlCount > 0 {
+		insertQuery += " USING TTL ?"
+		// 提取数据值时也要相应修改
+		dataValues = make([]interface{}, len(columns)+1) // +1 是为了TTL值
+		for i := range columns {
+			colType := columnTypes[columns[i].Name]
+			isCollection := strings.Contains(colType, "list<") ||
+				strings.Contains(colType, "map<") ||
+				strings.Contains(colType, "set<")
+
+			if !pkMap[columns[i].Name] && !isCollection {
+				dataValues[i] = *(ttlValues[i].(*int))
+			}
+		}
+		dataValues[len(dataValues)-1] = dataValues[0] // 将TTL值设置为第一个非集合且非主键列的TTL
+	} else {
+		dataValues = make([]interface{}, len(columns)) // 没有TTL值
 	}
 
 	logrus.Debugf("插入语句: %s", insertQuery)
@@ -559,27 +582,77 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 		}
 
 		// 提取数据值
-		dataValues := make([]interface{}, len(columns)+ttlCount) // 调整大小为列数+TTL数
+		dataValues := make([]interface{}, len(columns))
 		valueIndex := 0
-		for i := range columns { // 只使用索引
-			// 所有列都需要值
-			dataValues[valueIndex] = values[i]
+
+		// 复制列值
+		for i := range columns {
+			switch v := values[i].(type) {
+			case *[]map[string]interface{}:
+				// 对于 list<frozen<...>> 类型
+				if v != nil {
+					dataValues[valueIndex] = *v // 直接使用解引用的值
+				}
+			case *map[string]interface{}:
+				// 对于 frozen<...> 类型
+				if v != nil {
+					dataValues[valueIndex] = *v // 直接使用解引用的值
+				}
+			case *[]interface{}:
+				// 对于 list<...> 类型
+				if v != nil {
+					dataValues[valueIndex] = *v // 直接使用解引用的值
+				}
+			case *[]byte:
+				if v != nil {
+					dataValues[valueIndex] = *v // 对于blob类型，直接使用解引用的值
+				}
+			case *int64:
+				if v != nil {
+					dataValues[valueIndex] = *v
+				}
+			case *int:
+				if v != nil {
+					dataValues[valueIndex] = *v
+				}
+			case *bool:
+				if v != nil {
+					dataValues[valueIndex] = *v
+				}
+			case *string:
+				if v != nil {
+					dataValues[valueIndex] = *v
+				}
+			default:
+				if v != nil {
+					// 对于其他类型，使用反射获取实际值
+					dataValues[valueIndex] = reflect.ValueOf(v).Elem().Interface()
+				}
+			}
 			valueIndex++
 		}
 
-		// 添加TTL值
-		for i := range columns { // 只使用索引
-			if !pkMap[columns[i].Name] {
-				dataValues[valueIndex] = ttlValues[i]
-				valueIndex++
+		// 如果需要TTL，添加TTL值
+		if ttlCount > 0 {
+			// 找到第一个非集合且非主键列的TTL值
+			for i := range columns {
+				colType := columnTypes[columns[i].Name]
+				isCollection := strings.Contains(colType, "list<") ||
+					strings.Contains(colType, "map<") ||
+					strings.Contains(colType, "set<")
+
+				if !pkMap[columns[i].Name] && !isCollection && ttlValues[i] != nil {
+					ttlVal := *(ttlValues[i].(*int))
+					dataValues = append(dataValues, ttlVal)
+					break
+				}
 			}
 		}
-
 
 		// 更新最后处理的位置
 		currentKey := make(map[string]string)
 		for i, col := range columns {
-			if pkMap[col.Name] {
+			if partitionKeys[col.Name] {
 				switch v := values[i].(type) {
 				case *string:
 					if v != nil {
@@ -587,7 +660,7 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 					}
 				case *[]byte:
 					if v != nil {
-						currentKey[col.Name] = string(*v)
+						currentKey[col.Name] = fmt.Sprintf("%x", *v)
 					}
 				case *int:
 					if v != nil {
@@ -598,7 +671,6 @@ func (m *Migration) copyData(ctx context.Context, sourceName, targetName string,
 						currentKey[col.Name] = fmt.Sprintf("%d", *v)
 					}
 				default:
-					// 对于其他类型，先解引用再转换
 					if v != nil {
 						currentKey[col.Name] = fmt.Sprintf("%v", reflect.ValueOf(v).Elem().Interface())
 					}
@@ -838,70 +910,81 @@ func (m *Migration) saveCheckpoint(tableName string, lastKey map[string]string) 
 }
 
 func (m *Migration) buildWhereClause(columnTypes map[string]string, tableName string) string {
-	// 获取分区键
-	var partitionKeys []string
+	// 加载断点信息
+	checkpoint, err := m.loadCheckpoint(tableName)
+	if err != nil || checkpoint == nil || len(checkpoint.LastKey) == 0 {
+		return ""
+	}
 
-	// 获取列信息
-	colQuery := fmt.Sprintf(`
-		SELECT column_name, kind
+	// 获取所有分区键
+	pkQuery := fmt.Sprintf(`
+		SELECT column_name, kind, position
 		FROM system_schema.columns 
 		WHERE keyspace_name = '%s' 
 		AND table_name = '%s'`,
-		m.config.Source.Keyspace,
-		tableName)
+		m.config.Source.Keyspace, tableName)
 
-	logrus.Infof("执行列信息查询:\n%s", colQuery)
-	iter := m.source.Query(colQuery).Iter()
-	var colName, kind string
+	iter := m.source.Query(pkQuery).Iter()
+	var columnName, kind string
+	var position int
+	partitionKeys := make([]string, 0)
 
-	for iter.Scan(&colName, &kind) {
+	// 收集所有分区键，并按position排序
+	type pkInfo struct {
+		name     string
+		position int
+	}
+	var pks []pkInfo
+
+	for iter.Scan(&columnName, &kind, &position) {
 		if kind == "partition_key" {
-			logrus.Debugf("找到分区键: %s", colName)
-			partitionKeys = append(partitionKeys, colName)
+			pks = append(pks, pkInfo{columnName, position})
 		}
 	}
-	iter.Close()
-
-	if len(partitionKeys) == 0 {
-		logrus.Warningln("警告: 未找到分区键")
+	if err := iter.Close(); err != nil {
+		logrus.Warnf("获取分区键信息失败: %v", err)
 		return ""
 	}
 
-	// 加载断点信息
-	checkpoint, err := m.loadCheckpoint(tableName)
-	if err != nil {
-		logrus.Warnf("加载断点失败: %v, 将从头开始", err)
-		return ""
+	// 按position排序
+	sort.Slice(pks, func(i, j int) bool {
+		return pks[i].position < pks[j].position
+	})
+
+	// 提取排序后的分区键名称
+	for _, pk := range pks {
+		partitionKeys = append(partitionKeys, pk.name)
 	}
 
-	// 如果有断点信息，只使用分区键构建条件
-	if checkpoint != nil && len(checkpoint.LastKey) > 0 {
-		// 检查是否所有分区键都存在
-		allPartitionKeysPresent := true
-		partitionKeyValues := make([]string, len(partitionKeys))
-		for i, key := range partitionKeys {
-			if val, ok := checkpoint.LastKey[key]; ok {
-				partitionKeyValues[i] = fmt.Sprintf("'%s'", val)
-			} else {
-				allPartitionKeysPresent = false
-				break
+	// 构建 token 函数的参数
+	tokenArgs := make([]string, len(partitionKeys))
+	lastTokenArgs := make([]string, len(partitionKeys))
+
+	for i, key := range partitionKeys {
+		tokenArgs[i] = key
+		if lastVal, ok := checkpoint.LastKey[key]; ok {
+			switch columnTypes[key] {
+			case "text", "varchar", "ascii":
+				lastTokenArgs[i] = fmt.Sprintf("'%s'", lastVal)
+			case "blob":
+				lastTokenArgs[i] = fmt.Sprintf("0x%s", lastVal)
+			default:
+				lastTokenArgs[i] = lastVal
 			}
-		}
-
-		if allPartitionKeysPresent {
-			// 构建 token 条件，包含所有分区键
-			whereClause := fmt.Sprintf("token(%s) >= token(%s)",
-				strings.Join(partitionKeys, ", "),
-				strings.Join(partitionKeyValues, ", "))
-
-			logrus.Infof("断点续传条件:\n  分区键: %v\n  完整条件: %s",
-				partitionKeys,
-				whereClause)
-			return whereClause
+		} else {
+			// 如果缺少任何分区键的值，返回空字符串
+			return ""
 		}
 	}
 
-	return ""
+	whereClause := fmt.Sprintf("token(%s) >= token(%s)",
+		strings.Join(tokenArgs, ", "),
+		strings.Join(lastTokenArgs, ", "))
+
+	logrus.Infof("断点续传条件:\n  分区键: %v\n  完整条件: %s",
+		partitionKeys, whereClause)
+
+	return whereClause
 }
 
 func loadConfig(filename string) (*Config, error) {
