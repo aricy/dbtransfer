@@ -81,8 +81,8 @@ func (m *MySQLMigration) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(m.config.Source.Tables))
 
-	// 启动进度报告，修改为10秒
-	ticker := time.NewTicker(time.Second * 10)
+	// 启动进度报告，修改为5秒
+	ticker := time.NewTicker(time.Second * 5)
 	go func() {
 		for range ticker.C {
 			m.stats.report()
@@ -506,13 +506,6 @@ func (m *MySQLMigration) processBatch(rows *sql.Rows, batchSize int) ([]interfac
 	return batch, count, maxID, nil
 }
 
-// 添加辅助函数
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
 
 // 其他 MySQL 迁移相关的方法...
 

@@ -1,30 +1,30 @@
 source:
-  type: mysql  # 或 cassandra
   hosts:
-    - "source-mysql-host:3306"  # MySQL 端口
-  database: "source_db"  # 对 MySQL 是数据库名，对 Cassandra 是 keyspace
-  username: "source_user"
-  password: "source_password"
+    - "localhost:27017"  # MongoDB/MySQL/Cassandra 的主机地址
+  database: "test_db"    # MySQL/MongoDB 的数据库名
+  keyspace: "test_ks"    # Cassandra 的 keyspace
+  username: "root"
+  password: "password"
   tables:
-    - name: "table1"
-      target_name: "new_table1"  # 可选，如果需要在目标库中使用不同的表名
-    - name: "table2"
-    - name: "table3"
+    - name: "users"
+      target_name: "users_new"  # 可选，指定目标表名
+    - name: "orders"
+    - name: "products"
 
 destination:
-  type: mysql
   hosts:
-    - "dest-mysql-host:3306"
-  database: "dest_db"
-  username: "dest_user"
-  password: "dest_password"
+    - "localhost:27018"
+  database: "new_db"
+  keyspace: "new_ks"
+  username: "root"
+  password: "password"
 
 migration:
-  batch_size: 1000
-  workers: 4
-  rate_limit: 5000  # 每秒写入操作数限制
-  timeout: 30       # 连接超时时间(秒)
-  checkpoint_dir: "./checkpoints"  # 断点文件存储目录
-  log_file: "./migration.log"    # 添加日志文件路径
-  checkpoint_delay: 30  # 可选，默认60秒
-  log_level: "info"  # 可选，日志级别，默认info
+  batch_size: 1000        # 每批处理的记录数
+  workers: 4              # 并发工作线程数
+  rate_limit: 5000        # 每秒处理的记录数限制
+  timeout: 30             # 连接超时时间（秒）
+  checkpoint_dir: "./checkpoints"  # 断点续传文件保存目录
+  checkpoint_delay: 60    # 断点保存间隔（秒）
+  log_file: "./migration.log"
+  log_level: "info"

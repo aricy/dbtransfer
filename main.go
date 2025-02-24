@@ -21,7 +21,7 @@ func main() {
 	var showVersion bool
 	flag.BoolVar(&showVersion, "version", false, "显示版本信息")
 	configFile := flag.String("config", "config.yaml", "配置文件路径")
-	migrationType := flag.String("type", "cassandra", "迁移类型: cassandra 或 mysql")
+	migrationType := flag.String("type", "cassandra", "迁移类型: cassandra/mysql/mongodb")
 	flag.Parse()
 
 	// 如果指定了 version 标志，显示版本信息并退出
@@ -46,6 +46,8 @@ func main() {
 		migration, err = NewCassandraMigration(config)
 	case "mysql":
 		migration, err = NewMySQLMigration(config)
+	case "mongodb":
+		migration, err = NewMongoDBMigration(config)
 	default:
 		logrus.Fatalf("不支持的迁移类型: %s", *migrationType)
 	}
