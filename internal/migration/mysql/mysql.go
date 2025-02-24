@@ -212,7 +212,7 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 
 	// 获取总行数
 	var totalRows int64
-	var lastID int64
+	lastID := int64(0)
 	if checkpoint != nil {
 		if id, ok := checkpoint.LastKey["id"]; ok {
 			lastID, _ = strconv.ParseInt(id, 10, 64)
@@ -227,23 +227,18 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 
 	logrus.Infof("总行数: %d (从ID %d 开始)", totalRows, lastID)
 
-	// 设置定期保存断点
-	checkpointDelay := time.Duration(m.config.Migration.CheckpointDelay)
-	if checkpointDelay == 0 {
-		checkpointDelay = 60
-	}
-	checkpointTicker := time.NewTicker(time.Second * checkpointDelay)
+	// 创建断点保存计时器
+	checkpointTicker := time.NewTicker(time.Second) // 每秒保存一次断点
 	defer checkpointTicker.Stop()
 
-	// 启动断点保存协程
 	go func() {
-		for range checkpointTicker.C {
-			if m.lastID > 0 {
-				lastKey := map[string]string{"id": strconv.FormatInt(m.lastID, 10)}
-				if err := m.saveCheckpoint(table.Name, lastKey, false); err != nil {
-					logrus.Errorf("保存断点失败: %v", err)
-				} else {
-					logrus.Infof("保存断点成功，位置: %v", lastKey)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-checkpointTicker.C:
+				if err := m.saveCheckpoint(table.Name, map[string]string{"id": strconv.FormatInt(lastID, 10)}, false); err != nil {
+					logrus.Warnf("保存断点失败: %v", err)
 				}
 			}
 		}

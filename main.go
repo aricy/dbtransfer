@@ -15,6 +15,7 @@ import (
 	"dbtransfer/internal/migration/cassandra"
 	"dbtransfer/internal/migration/mongodb"
 	"dbtransfer/internal/migration/mysql"
+	"dbtransfer/internal/migration/postgresql"
 )
 
 const VERSION = "0.1"
@@ -55,7 +56,7 @@ func main() {
 	var showVersion bool
 	flag.BoolVar(&showVersion, "version", false, "显示版本信息")
 	configFile := flag.String("config", "config.yaml", "配置文件路径")
-	migrationType := flag.String("type", "cassandra", "迁移类型: cassandra/mysql/mongodb")
+	migrationType := flag.String("type", "cassandra", "迁移类型: cassandra/mysql/mongodb/postgresql")
 	flag.Parse()
 
 	// 如果指定了 version 标志，显示版本信息并退出
@@ -82,6 +83,8 @@ func main() {
 		migration, err = mysql.NewMigration(config)
 	case "mongodb":
 		migration, err = mongodb.NewMigration(config)
+	case "postgresql":
+		migration, err = postgresql.NewMigration(config)
 	default:
 		logrus.Fatalf("不支持的迁移类型: %s", *migrationType)
 	}

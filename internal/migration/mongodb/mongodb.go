@@ -299,12 +299,8 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, table config.T
 		}
 	}
 
-	// 设置定期保存断点
-	checkpointDelay := time.Duration(m.config.Migration.CheckpointDelay)
-	if checkpointDelay == 0 {
-		checkpointDelay = 60 // 默认60秒
-	}
-	checkpointTicker := time.NewTicker(time.Second * checkpointDelay)
+	// 创建断点保存计时器
+	checkpointTicker := time.NewTicker(time.Second) // 每秒保存一次断点
 	defer checkpointTicker.Stop()
 
 	var mu sync.Mutex
@@ -320,9 +316,7 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, table config.T
 				if lastProcessedID != nil {
 					lastKey := map[string]string{"_id": getIDString(lastProcessedID)}
 					if err := m.saveCheckpoint(table.Name, lastKey, false); err != nil {
-						logrus.Errorf("保存断点失败: %v", err)
-					} else {
-						logrus.Infof("保存断点成功，位置: map[_id:%s]", getIDString(lastProcessedID))
+						logrus.Warnf("保存断点失败: %v", err)
 					}
 				}
 				mu.Unlock()
@@ -413,9 +407,7 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, table config.T
 	if lastProcessedID != nil {
 		lastKey := map[string]string{"_id": getIDString(lastProcessedID)}
 		if err := m.saveCheckpoint(table.Name, lastKey, false); err != nil {
-			logrus.Errorf("保存断点失败: %v", err)
-		} else {
-			logrus.Infof("保存断点成功，位置: map[_id:%s]", getIDString(lastProcessedID))
+			logrus.Warnf("保存断点失败: %v", err)
 		}
 	}
 

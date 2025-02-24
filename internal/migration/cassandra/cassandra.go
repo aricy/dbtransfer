@@ -580,12 +580,8 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 	count := 0
 	rowCount := 0
 
-	// 定期保存断点，使用配置的间隔时间，默认60秒
-	checkpointDelay := time.Duration(m.config.Migration.CheckpointDelay)
-	if checkpointDelay == 0 {
-		checkpointDelay = 60
-	}
-	checkpointTicker := time.NewTicker(time.Second * checkpointDelay)
+	// 创建断点保存计时器
+	checkpointTicker := time.NewTicker(time.Second) // 每秒保存一次断点
 	defer checkpointTicker.Stop()
 
 	// 创建一个变量来存储最后处理的位置
@@ -596,9 +592,7 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 			m.stats.Mu.Lock()
 			if lastProcessedKey != nil {
 				if err := m.saveCheckpoint(sourceName, lastProcessedKey, false); err != nil {
-					logrus.Errorf("保存断点失败: %v", err)
-				} else {
-					logrus.Infof("保存断点成功，位置: %+v", lastProcessedKey)
+					logrus.Warnf("保存断点失败: %v", err)
 				}
 			}
 			m.stats.Mu.Unlock()

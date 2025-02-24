@@ -1,7 +1,8 @@
 source:
   hosts:
-    - "localhost:27017"  # MongoDB/MySQL/Cassandra 的主机地址
-  database: "test_db"    # MySQL/MongoDB 的数据库名
+    - "localhost:27017"  # MongoDB/MySQL/Cassandra/PostgreSQL 的主机地址
+  database: "test_db"    # MySQL/MongoDB/PostgreSQL 的数据库名
+  schema: public # PostgreSQL 的 schema，默认public
   keyspace: "test_ks"    # Cassandra 的 keyspace
   username: "root"
   password: "password"

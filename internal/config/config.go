@@ -11,6 +11,7 @@ type DBConfig struct {
 	Hosts    []string       `yaml:"hosts"`
 	Keyspace string         `yaml:"keyspace"` // Cassandra 使用
 	Database string         `yaml:"database"` // MySQL/MongoDB 使用
+	Schema   string         `yaml:"schema"`   // PostgreSQL 使用
 	Username string         `yaml:"username"`
 	Password string         `yaml:"password"`
 	Tables   []TableMapping `yaml:"tables,omitempty"`
@@ -29,7 +30,6 @@ type MigrationConfig struct {
 	CheckpointDir    string `yaml:"checkpoint_dir"`
 	LogFile          string `yaml:"log_file"`
 	LogLevel         string `yaml:"log_level"`
-	CheckpointDelay  int    `yaml:"checkpoint_delay"`
 	ProgressInterval int    `yaml:"progress_interval"`
 }
 
@@ -49,9 +49,6 @@ func (c *MigrationConfig) SetDefaults() {
 	}
 	if c.CheckpointDir == "" {
 		c.CheckpointDir = "./data/checkpoints"
-	}
-	if c.CheckpointDelay <= 0 {
-		c.CheckpointDelay = 60
 	}
 	if c.ProgressInterval <= 0 {
 		c.ProgressInterval = 5

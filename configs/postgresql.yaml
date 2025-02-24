@@ -1,0 +1,29 @@
+source:
+  hosts:
+    - "10.58.11.90:5432"  # 使用正确的格式：host:port
+  database: "mydatabase"
+  schema: "myschema"  # 指定源数据库 schema
+  username: "your_username"
+  password: "your_password"
+  tables:
+    - name: "table1"
+    - name: "table2"
+
+destination:
+  hosts:
+    - "destination.host:5432"
+  database: "target_db"
+  schema: "myschema"  # 指定目标数据库 schema
+  username: "dest_user"
+  password: "dest_password"
+
+migration:
+  batch_size: 1000
+  workers: 4
+  rate_limit: 10000
+  timeout: 30
+  checkpoint_dir: "./data/checkpoints"
+  checkpoint_delay: 60
+  log_file: "./data/logs/migration.log"
+  log_level: "info"
+  progress_interval: 5 
