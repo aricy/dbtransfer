@@ -4,13 +4,6 @@
 // not use this file except in compliance with the License. You may obtain
 // a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
 
-// Package ocsp is intended for internal use only. It is made available to
-// facilitate use cases that require access to internal MongoDB driver
-// functionality and state. The API of this package is not stable and there is
-// no backward compatibility guarantee.
-//
-// WARNING: THIS PACKAGE IS EXPERIMENTAL AND MAY BE MODIFIED OR REMOVED WITHOUT
-// NOTICE! USE WITH EXTREME CAUTION!
 package ocsp
 
 import (
@@ -168,10 +161,10 @@ func processStaple(cfg config, staple []byte) (*ResponseDetails, error) {
 		// If the stapled response could not be parsed correctly, error. This can happen if the response is malformed,
 		// the response does not cover the certificate presented by the server, or if the response contains an error
 		// status.
-		return nil, fmt.Errorf("error parsing stapled response: %w", err)
+		return nil, fmt.Errorf("error parsing stapled response: %v", err)
 	}
 	if err = verifyResponse(cfg, parsedResponse); err != nil {
-		return nil, fmt.Errorf("error validating stapled response: %w", err)
+		return nil, fmt.Errorf("error validating stapled response: %v", err)
 	}
 
 	return extractResponseDetails(parsedResponse), nil
@@ -199,7 +192,7 @@ func isMustStapleCertificate(cert *x509.Certificate) (bool, error) {
 	// Use []*big.Int to ensure that all values in the sequence can be successfully unmarshalled.
 	var featureValues []*big.Int
 	if _, err := asn1.Unmarshal(featureExtension.Value, &featureValues); err != nil {
-		return false, fmt.Errorf("error unmarshalling TLS feature extension values: %w", err)
+		return false, fmt.Errorf("error unmarshalling TLS feature extension values: %v", err)
 	}
 
 	for _, value := range featureValues {

@@ -8,7 +8,6 @@ package topology
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -87,9 +86,9 @@ type pinnedConnections struct {
 // Error implements the error interface.
 func (w WaitQueueTimeoutError) Error() string {
 	errorMsg := "timed out while checking out a connection from connection pool"
-	switch {
-	case w.Wrapped == nil:
-	case errors.Is(w.Wrapped, context.Canceled):
+	switch w.Wrapped {
+	case nil:
+	case context.Canceled:
 		errorMsg = fmt.Sprintf(
 			"%s: %s",
 			"canceled while checking out a connection from connection pool",

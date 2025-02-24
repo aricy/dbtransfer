@@ -1,4 +1,4 @@
-package main
+package cassandra
 
 import (
 	"context"
@@ -16,13 +16,15 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v2"
+
+	"dbtransfer/internal/config"
+	"dbtransfer/internal/migration"
 )
 
 type TableMapping struct {
 	Name       string `yaml:"name"`
 	TargetName string `yaml:"target_name,omitempty"`
 }
-
 
 type MigrationConfig struct {
 	BatchSize       int    `yaml:"batch_size"`
@@ -36,8 +38,8 @@ type MigrationConfig struct {
 }
 
 type Config struct {
-	Source      DBConfig        `yaml:"source"`
-	Destination DBConfig        `yaml:"destination"`
+	Source      config.DBConfig `yaml:"source"`
+	Destination config.DBConfig `yaml:"destination"`
 	Migration   MigrationConfig `yaml:"migration"`
 }
 
@@ -45,16 +47,16 @@ type MigrationStats struct {
 	TotalRows     int64
 	ProcessedRows int64
 	StartTime     time.Time
-	mu            sync.Mutex
+	Mu            sync.Mutex
 }
 
-func (s *MigrationStats) increment(count int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *MigrationStats) Increment(count int) {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	s.ProcessedRows += int64(count)
 }
 
-func (s *MigrationStats) report() {
+func (s *MigrationStats) Report() {
 	duration := time.Since(s.StartTime)
 	rate := float64(s.ProcessedRows) / duration.Seconds()
 	logrus.Infof("进度: %d/%d 行 (%.2f%%), 速率: %.2f 行/秒",
@@ -65,9 +67,9 @@ func (s *MigrationStats) report() {
 type CassandraMigration struct {
 	source     *gocql.Session
 	dest       *gocql.Session
-	config     *Config
+	config     *config.Config
 	limiter    *rate.Limiter
-	stats      *MigrationStats
+	stats      *migration.MigrationStats
 	maxRetries int
 	retryDelay time.Duration
 }
@@ -79,30 +81,52 @@ type TokenRange struct {
 	Complete bool              `json:"complete"`
 }
 
-func NewCassandraMigration(config *Config) (*CassandraMigration, error) {
+func NewMigration(config *config.Config) (migration.Migration, error) {
+	if config.Source.Keyspace == "" || config.Destination.Keyspace == "" {
+		return nil, fmt.Errorf("未配置 keyspace")
+	}
+
+	// 先验证配置
+	if err := validateConfig(config); err != nil {
+		return nil, err
+	}
+
 	sourceCluster := createClusterConfig(config.Source)
 	destCluster := createClusterConfig(config.Destination)
 
-	sourceCluster.Timeout = time.Duration(config.Migration.Timeout) * time.Second
-	destCluster.Timeout = time.Duration(config.Migration.Timeout) * time.Second
-
 	sourceSession, err := sourceCluster.CreateSession()
 	if err != nil {
+		logrus.Errorf("连接源 Cassandra 失败: %v", err)
 		return nil, fmt.Errorf("连接源数据库失败: %v", err)
 	}
 
 	destSession, err := destCluster.CreateSession()
 	if err != nil {
 		sourceSession.Close()
+		logrus.Errorf("连接目标 Cassandra 失败: %v", err)
 		return nil, fmt.Errorf("连接目标数据库失败: %v", err)
 	}
 
+	// 验证连接
+	if err := validateConnection(sourceSession, config.Source.Keyspace); err != nil {
+		sourceSession.Close()
+		destSession.Close()
+		return nil, fmt.Errorf("验证源数据库连接失败: %v", err)
+	}
+
+	if err := validateConnection(destSession, config.Destination.Keyspace); err != nil {
+		sourceSession.Close()
+		destSession.Close()
+		return nil, fmt.Errorf("验证目标数据库连接失败: %v", err)
+	}
+
+	logrus.Info("Cassandra 连接成功")
 	return &CassandraMigration{
 		source:     sourceSession,
 		dest:       destSession,
 		config:     config,
 		limiter:    rate.NewLimiter(rate.Limit(config.Migration.RateLimit), config.Migration.RateLimit),
-		stats:      &MigrationStats{StartTime: time.Now()},
+		stats:      &migration.MigrationStats{StartTime: time.Now()},
 		maxRetries: 3,
 		retryDelay: time.Second * 5,
 	}, nil
@@ -125,7 +149,7 @@ func (m *CassandraMigration) Run(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second * 10)
 	go func() {
 		for range ticker.C {
-			m.stats.report()
+			m.stats.Report()
 		}
 	}()
 	defer ticker.Stop()
@@ -133,7 +157,7 @@ func (m *CassandraMigration) Run(ctx context.Context) error {
 	// 并发迁移表
 	for _, table := range m.config.Source.Tables {
 		wg.Add(1)
-		go func(table TableMapping) {
+		go func(table config.TableMapping) {
 			defer wg.Done()
 			if err := m.migrateTable(ctx, table); err != nil {
 				errChan <- fmt.Errorf("迁移表 %s 失败: %v", table.Name, err)
@@ -155,11 +179,11 @@ func (m *CassandraMigration) Run(ctx context.Context) error {
 		return fmt.Errorf("迁移过程中发生错误:\n%s", strings.Join(errors, "\n"))
 	}
 
-	m.stats.report() // 最终报告
+	m.stats.Report() // 最终报告
 	return nil
 }
 
-func (m *CassandraMigration) migrateTable(ctx context.Context, table TableMapping) error {
+func (m *CassandraMigration) migrateTable(ctx context.Context, table config.TableMapping) error {
 	// 首先检查表是否存在
 	keyspace := m.config.Source.Keyspace
 	tableExistsQuery := fmt.Sprintf(`
@@ -175,7 +199,6 @@ func (m *CassandraMigration) migrateTable(ctx context.Context, table TableMappin
 	iter.Close()
 
 	if !exists {
-		logrus.Infof("表 %s 在源数据库中不存在，跳过", table.Name)
 		return fmt.Errorf("表 %s 不存在", table.Name)
 	}
 
@@ -319,7 +342,7 @@ func buildTypeFields(names, types []string) string {
 	return strings.Join(fields, ", ")
 }
 
-func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetName string, checkpoint *Checkpoint) error {
+func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetName string, checkpoint *migration.Checkpoint) error {
 	// 在开始处检查完成标记
 	if checkpoint != nil && checkpoint.Complete {
 		logrus.Infof("表 %s 已完成迁移，跳过执行", sourceName)
@@ -547,7 +570,7 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 
 	go func() {
 		for range checkpointTicker.C {
-			m.stats.mu.Lock()
+			m.stats.Mu.Lock()
 			if lastProcessedKey != nil {
 				if err := m.saveCheckpoint(sourceName, lastProcessedKey, false); err != nil {
 					logrus.Errorf("保存断点失败: %v", err)
@@ -555,7 +578,7 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 					logrus.Infof("保存断点成功，位置: %+v", lastProcessedKey)
 				}
 			}
-			m.stats.mu.Unlock()
+			m.stats.Mu.Unlock()
 		}
 	}()
 
@@ -662,9 +685,9 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 				}
 			}
 		}
-		m.stats.mu.Lock()
+		m.stats.Mu.Lock()
 		lastProcessedKey = currentKey
-		m.stats.mu.Unlock()
+		m.stats.Mu.Unlock()
 
 		// 添加到批处理
 		batch.Query(insertQuery, dataValues...)
@@ -675,7 +698,7 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 				return err
 			}
 			batch = m.dest.NewBatch(gocql.UnloggedBatch)
-			m.stats.increment(count)
+			m.stats.Increment(count)
 			count = 0
 		}
 	}
@@ -685,7 +708,7 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 		if err := m.executeBatchWithRetry(batch); err != nil {
 			return err
 		}
-		m.stats.increment(count)
+		m.stats.Increment(count)
 	}
 
 	// 如果迭代器没有错误，说明已经处理完所有数据，标记为完成
@@ -819,7 +842,7 @@ func (m *CassandraMigration) buildInsertQuery(tableName string, columnNames []st
 	return query
 }
 
-func (m *CassandraMigration) loadCheckpoint(tableName string) (*Checkpoint, error) {
+func (m *CassandraMigration) loadCheckpoint(tableName string) (*migration.Checkpoint, error) {
 	checkpoint, err := m.loadCheckpointFile(tableName)
 	if err != nil {
 		return nil, err
@@ -827,14 +850,13 @@ func (m *CassandraMigration) loadCheckpoint(tableName string) (*Checkpoint, erro
 
 	// 如果发现完成标记，返回带完成标记的 checkpoint
 	if checkpoint != nil && checkpoint.Complete {
-		logrus.Infof("表 %s 已完成迁移，跳过", tableName)
 		return checkpoint, nil
 	}
 
 	return checkpoint, nil
 }
 
-func (m *CassandraMigration) loadCheckpointFile(tableName string) (*Checkpoint, error) {
+func (m *CassandraMigration) loadCheckpointFile(tableName string) (*migration.Checkpoint, error) {
 	if m.config.Migration.CheckpointDir == "" {
 		return nil, nil
 	}
@@ -850,7 +872,7 @@ func (m *CassandraMigration) loadCheckpointFile(tableName string) (*Checkpoint, 
 		return nil, err
 	}
 
-	var checkpoint Checkpoint
+	var checkpoint migration.Checkpoint
 	if err := json.Unmarshal(data, &checkpoint); err != nil {
 		return nil, err
 	}
@@ -863,7 +885,7 @@ func (m *CassandraMigration) saveCheckpoint(tableName string, lastKey map[string
 		return nil
 	}
 
-	checkpoint := &Checkpoint{
+	checkpoint := &migration.Checkpoint{
 		LastKey:     lastKey,
 		LastUpdated: time.Now(),
 		Complete:    completed,
@@ -973,12 +995,48 @@ func loadConfig(filename string) (*Config, error) {
 	return &config, nil
 }
 
-func createClusterConfig(dbConfig DBConfig) *gocql.ClusterConfig {
+func createClusterConfig(dbConfig config.DBConfig) *gocql.ClusterConfig {
+	if len(dbConfig.Hosts) == 0 {
+		logrus.Fatal("未配置 Cassandra 主机地址")
+	}
+
+	logrus.Infof("正在连接 Cassandra 集群: %v, keyspace: %s", dbConfig.Hosts, dbConfig.Keyspace)
 	cluster := gocql.NewCluster(dbConfig.Hosts...)
 	cluster.Keyspace = dbConfig.Keyspace
 	cluster.Authenticator = gocql.PasswordAuthenticator{
 		Username: dbConfig.Username,
 		Password: dbConfig.Password,
 	}
+	cluster.Consistency = gocql.Quorum
+	cluster.ConnectTimeout = time.Second * 10
+	cluster.Timeout = time.Second * 30
+	cluster.RetryPolicy = &gocql.SimpleRetryPolicy{NumRetries: 3}
+	cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy())
 	return cluster
+}
+
+// 添加配置验证函数
+func validateConfig(config *config.Config) error {
+	if len(config.Source.Hosts) == 0 {
+		return fmt.Errorf("未配置源 Cassandra 主机地址")
+	}
+	if len(config.Destination.Hosts) == 0 {
+		return fmt.Errorf("未配置目标 Cassandra 主机地址")
+	}
+	if config.Source.Username == "" || config.Source.Password == "" {
+		return fmt.Errorf("未配置源 Cassandra 认证信息")
+	}
+	if config.Destination.Username == "" || config.Destination.Password == "" {
+		return fmt.Errorf("未配置目标 Cassandra 认证信息")
+	}
+	return nil
+}
+
+// 添加连接验证函数
+func validateConnection(session *gocql.Session, keyspace string) error {
+	// 尝试执行一个简单的查询来验证连接
+	if err := session.Query("SELECT release_version FROM system.local").Exec(); err != nil {
+		return fmt.Errorf("验证连接失败: %v", err)
+	}
+	return nil
 }

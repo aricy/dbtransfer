@@ -1,4 +1,4 @@
-package main
+package mongodb
 
 import (
 	"context"
@@ -16,20 +16,23 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/time/rate"
+
+	"dbtransfer/internal/config"
+	"dbtransfer/internal/migration"
 )
 
 type MongoDBMigration struct {
 	source     *mongo.Client
 	dest       *mongo.Client
-	config     *Config
+	config     *config.Config
 	limiter    *rate.Limiter
-	stats      *MigrationStats
+	stats      *migration.MigrationStats
 	maxRetries int
 	retryDelay time.Duration
 	lastID     interface{} // 记录最后处理的ID
 }
 
-func NewMongoDBMigration(config *Config) (*MongoDBMigration, error) {
+func NewMigration(config *config.Config) (migration.Migration, error) {
 	ctx := context.Background()
 
 	// 连接源数据库
@@ -57,18 +60,28 @@ func NewMongoDBMigration(config *Config) (*MongoDBMigration, error) {
 		dest:       destClient,
 		config:     config,
 		limiter:    limiter,
-		stats:      &MigrationStats{StartTime: time.Now()},
+		stats:      &migration.MigrationStats{StartTime: time.Now()},
 		maxRetries: 3,
 		retryDelay: time.Second * 5,
 	}, nil
 }
 
-func connectMongoDB(ctx context.Context, config DBConfig) (*mongo.Client, error) {
+func connectMongoDB(ctx context.Context, config config.DBConfig) (*mongo.Client, error) {
+	// 检查配置
+	if len(config.Hosts) == 0 {
+		return nil, fmt.Errorf("未配置数据库主机地址")
+	}
+	if config.Database == "" {
+		return nil, fmt.Errorf("未配置数据库名")
+	}
+
 	uri := fmt.Sprintf("mongodb://%s:%s@%s/%s?authSource=admin",
 		config.Username,
 		config.Password,
 		strings.Join(config.Hosts, ","),
 		config.Database)
+
+	logrus.Infof("正在连接 MongoDB: %s", strings.Replace(uri, config.Password, "****", 1))
 
 	opts := options.Client().
 		ApplyURI(uri).
@@ -80,14 +93,21 @@ func connectMongoDB(ctx context.Context, config DBConfig) (*mongo.Client, error)
 
 	client, err := mongo.Connect(ctx, opts)
 	if err != nil {
+		logrus.Errorf("连接 MongoDB 失败: %v", err)
 		return nil, err
 	}
 
-	if err = client.Ping(ctx, nil); err != nil {
+	// 设置连接超时
+	ctxTimeout, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	if err = client.Ping(ctxTimeout, nil); err != nil {
+		logrus.Errorf("Ping MongoDB 失败: %v", err)
 		client.Disconnect(ctx)
 		return nil, err
 	}
 
+	logrus.Info("MongoDB 连接成功")
 	return client, nil
 }
 
@@ -109,7 +129,7 @@ func (m *MongoDBMigration) Run(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second * 5)
 	go func() {
 		for range ticker.C {
-			m.stats.report()
+			m.stats.Report()
 		}
 	}()
 	defer ticker.Stop()
@@ -117,7 +137,7 @@ func (m *MongoDBMigration) Run(ctx context.Context) error {
 	// 并发迁移集合
 	for _, table := range m.config.Source.Tables {
 		wg.Add(1)
-		go func(table TableMapping) {
+		go func(table config.TableMapping) {
 			defer wg.Done()
 			if err := m.migrateCollection(ctx, table); err != nil {
 				errChan <- fmt.Errorf("迁移集合 %s 失败: %v", table.Name, err)
@@ -138,16 +158,28 @@ func (m *MongoDBMigration) Run(ctx context.Context) error {
 		return fmt.Errorf("迁移过程中发生错误:\n%s", strings.Join(errors, "\n"))
 	}
 
-	m.stats.report() // 最终报告
+	m.stats.Report() // 最终报告
 	return nil
 }
 
-func (m *MongoDBMigration) migrateCollection(ctx context.Context, table TableMapping) error {
+func (m *MongoDBMigration) migrateCollection(ctx context.Context, table config.TableMapping) error {
+	// 检查数据库连接
+	if m.source == nil || m.dest == nil {
+		return fmt.Errorf("数据库连接未初始化")
+	}
+
 	logrus.Infof("开始迁移集合: %s", table.Name)
 
 	// 获取源集合
 	sourceDB := m.source.Database(m.config.Source.Database)
+	if sourceDB == nil {
+		return fmt.Errorf("源数据库 %s 不存在", m.config.Source.Database)
+	}
+
 	sourceColl := sourceDB.Collection(table.Name)
+	if sourceColl == nil {
+		return fmt.Errorf("源集合 %s 不存在", table.Name)
+	}
 
 	// 检查集合是否存在，使用 bson.D
 	filter := bson.D{{"name", table.Name}}
@@ -324,7 +356,7 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, table TableMap
 			if err := m.insertBatch(ctx, destColl, batch); err != nil {
 				return err
 			}
-			m.stats.increment(count)
+			m.stats.Increment(count)
 			batch = batch[:0]
 			count = 0
 		}
@@ -351,7 +383,7 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, table TableMap
 		if err := m.insertBatch(ctx, destColl, batch); err != nil {
 			return err
 		}
-		m.stats.increment(len(batch))
+		m.stats.Increment(len(batch))
 	}
 
 	// 在断点保存协程中
@@ -428,7 +460,7 @@ func (m *MongoDBMigration) insertBatch(ctx context.Context, coll *mongo.Collecti
 	return nil
 }
 
-func (m *MongoDBMigration) loadCheckpoint(tableName string) (*Checkpoint, error) {
+func (m *MongoDBMigration) loadCheckpoint(tableName string) (*migration.Checkpoint, error) {
 	if m.config.Migration.CheckpointDir == "" {
 		return nil, nil
 	}
@@ -444,7 +476,7 @@ func (m *MongoDBMigration) loadCheckpoint(tableName string) (*Checkpoint, error)
 		return nil, err
 	}
 
-	var checkpoint Checkpoint
+	var checkpoint migration.Checkpoint
 	if err := json.Unmarshal(data, &checkpoint); err != nil {
 		return nil, err
 	}
@@ -457,7 +489,7 @@ func (m *MongoDBMigration) saveCheckpoint(tableName string, lastKey map[string]s
 		return nil
 	}
 
-	checkpoint := &Checkpoint{
+	checkpoint := &migration.Checkpoint{
 		LastKey:     lastKey,
 		LastUpdated: time.Now(),
 		Complete:    completed,

@@ -7,7 +7,6 @@
 package bsonrw
 
 import (
-	"errors"
 	"fmt"
 	"io"
 
@@ -443,7 +442,7 @@ func (c Copier) copyArray(dst ValueWriter, src ValueReader) error {
 
 	for {
 		vr, err := ar.ReadValue()
-		if errors.Is(err, ErrEOA) {
+		if err == ErrEOA {
 			break
 		}
 		if err != nil {
@@ -467,7 +466,7 @@ func (c Copier) copyArray(dst ValueWriter, src ValueReader) error {
 func (c Copier) copyDocumentCore(dw DocumentWriter, dr DocumentReader) error {
 	for {
 		key, vr, err := dr.ReadElement()
-		if errors.Is(err, ErrEOD) {
+		if err == ErrEOD {
 			break
 		}
 		if err != nil {

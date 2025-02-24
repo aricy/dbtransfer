@@ -60,22 +60,8 @@ type Zeroer interface {
 
 // StructCodec is the Codec used for struct values.
 //
-// Deprecated: StructCodec will not be directly configurable in Go Driver 2.0.
-// To configure the struct encode and decode behavior, use the configuration
-// methods on a [go.mongodb.org/mongo-driver/bson.Encoder] or
-// [go.mongodb.org/mongo-driver/bson.Decoder]. To configure the struct encode
-// and decode behavior for a mongo.Client, use
-// [go.mongodb.org/mongo-driver/mongo/options.ClientOptions.SetBSONOptions].
-//
-// For example, to configure a mongo.Client to omit zero-value structs when
-// using the "omitempty" struct tag, use:
-//
-//	opt := options.Client().SetBSONOptions(&options.BSONOptions{
-//	    OmitZeroStruct: true,
-//	})
-//
-// See the deprecation notice for each field in StructCodec for the corresponding
-// settings.
+// Deprecated: Use [go.mongodb.org/mongo-driver/bson.NewRegistry] to get a registry with the
+// StructCodec registered.
 type StructCodec struct {
 	cache  sync.Map // map[reflect.Type]*structDescription
 	parser StructTagParser
@@ -83,7 +69,7 @@ type StructCodec struct {
 	// DecodeZeroStruct causes DecodeValue to delete any existing values from Go structs in the
 	// destination value passed to Decode before unmarshaling BSON documents into them.
 	//
-	// Deprecated: Use bson.Decoder.ZeroStructs or options.BSONOptions.ZeroStructs instead.
+	// Deprecated: Use bson.Decoder.ZeroStructs instead.
 	DecodeZeroStruct bool
 
 	// DecodeDeepZeroInline causes DecodeValue to delete any existing values from Go structs in the
@@ -96,7 +82,7 @@ type StructCodec struct {
 	// MyStruct{}) as empty and omit it from the marshaled BSON when the "omitempty" struct tag
 	// option is set.
 	//
-	// Deprecated: Use bson.Encoder.OmitZeroStruct or options.BSONOptions.OmitZeroStruct instead.
+	// Deprecated: Use bson.Encoder.OmitZeroStruct instead.
 	EncodeOmitDefaultStruct bool
 
 	// AllowUnexportedFields allows encoding and decoding values from un-exported struct fields.
@@ -109,8 +95,7 @@ type StructCodec struct {
 	// a duplicate field in the marshaled BSON when the "inline" struct tag option is set. The
 	// default value is true.
 	//
-	// Deprecated: Use bson.Encoder.ErrorOnInlineDuplicates or
-	// options.BSONOptions.ErrorOnInlineDuplicates instead.
+	// Deprecated: Use bson.Encoder.ErrorOnInlineDuplicates instead.
 	OverwriteDuplicatedInlinedFields bool
 }
 
@@ -119,8 +104,8 @@ var _ ValueDecoder = &StructCodec{}
 
 // NewStructCodec returns a StructCodec that uses p for struct tag parsing.
 //
-// Deprecated: NewStructCodec will not be available in Go Driver 2.0. See
-// [StructCodec] for more details.
+// Deprecated: Use [go.mongodb.org/mongo-driver/bson.NewRegistry] to get a registry with the
+// StructCodec registered.
 func NewStructCodec(p StructTagParser, opts ...*bsonoptions.StructCodecOptions) (*StructCodec, error) {
 	if p == nil {
 		return nil, errors.New("a StructTagParser must be provided to NewStructCodec")
@@ -179,11 +164,11 @@ func (sc *StructCodec) EncodeValue(ec EncodeContext, vw bsonrw.ValueWriter, val 
 
 		desc.encoder, rv, err = defaultValueEncoders.lookupElementEncoder(ec, desc.encoder, rv)
 
-		if err != nil && !errors.Is(err, errInvalidValue) {
+		if err != nil && err != errInvalidValue {
 			return err
 		}
 
-		if errors.Is(err, errInvalidValue) {
+		if err == errInvalidValue {
 			if desc.omitEmpty {
 				continue
 			}
@@ -204,17 +189,17 @@ func (sc *StructCodec) EncodeValue(ec EncodeContext, vw bsonrw.ValueWriter, val 
 
 		encoder := desc.encoder
 
-		var empty bool
+		var zero bool
 		if cz, ok := encoder.(CodecZeroer); ok {
-			empty = cz.IsTypeZero(rv.Interface())
+			zero = cz.IsTypeZero(rv.Interface())
 		} else if rv.Kind() == reflect.Interface {
-			// isEmpty will not treat an interface rv as an interface, so we need to check for the
-			// nil interface separately.
-			empty = rv.IsNil()
+			// isZero will not treat an interface rv as an interface, so we need to check for the
+			// zero interface separately.
+			zero = rv.IsNil()
 		} else {
-			empty = isEmpty(rv, sc.EncodeOmitDefaultStruct || ec.omitZeroStruct)
+			zero = isZero(rv, sc.EncodeOmitDefaultStruct || ec.omitZeroStruct)
 		}
-		if desc.omitEmpty && empty {
+		if desc.omitEmpty && zero {
 			continue
 		}
 
@@ -254,8 +239,8 @@ func (sc *StructCodec) EncodeValue(ec EncodeContext, vw bsonrw.ValueWriter, val 
 }
 
 func newDecodeError(key string, original error) error {
-	var de *DecodeError
-	if !errors.As(original, &de) {
+	de, ok := original.(*DecodeError)
+	if !ok {
 		return &DecodeError{
 			keys:    []string{key},
 			wrapped: original,
@@ -323,7 +308,7 @@ func (sc *StructCodec) DecodeValue(dc DecodeContext, vr bsonrw.ValueReader, val 
 
 	for {
 		name, vr, err := dr.ReadElement()
-		if errors.Is(err, bsonrw.ErrEOD) {
+		if err == bsonrw.ErrEOD {
 			break
 		}
 		if err != nil {
@@ -406,15 +391,12 @@ func (sc *StructCodec) DecodeValue(dc DecodeContext, vr bsonrw.ValueReader, val 
 	return nil
 }
 
-func isEmpty(v reflect.Value, omitZeroStruct bool) bool {
+func isZero(v reflect.Value, omitZeroStruct bool) bool {
 	kind := v.Kind()
 	if (kind != reflect.Ptr || !v.IsNil()) && v.Type().Implements(tZeroer) {
 		return v.Interface().(Zeroer).IsZero()
 	}
-	switch kind {
-	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
-		return v.Len() == 0
-	case reflect.Struct:
+	if kind == reflect.Struct {
 		if !omitZeroStruct {
 			return false
 		}
@@ -428,7 +410,7 @@ func isEmpty(v reflect.Value, omitZeroStruct bool) bool {
 			if ff.PkgPath != "" && !ff.Anonymous {
 				continue // Private field
 			}
-			if !isEmpty(v.Field(i), omitZeroStruct) {
+			if !isZero(v.Field(i), omitZeroStruct) {
 				return false
 			}
 		}

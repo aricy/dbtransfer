@@ -4,16 +4,36 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"os"
 
 	"github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v2"
+
+	"dbtransfer/internal/migration"
+	"dbtransfer/internal/migration/cassandra"
+	"dbtransfer/internal/migration/mongodb"
+	"dbtransfer/internal/migration/mysql"
 )
 
 const VERSION = "0.1"
 
-type Migration interface {
-	Run(ctx context.Context) error
-	Close()
+// 使用 migration 包中的接口
+type Migration = migration.Migration
+
+// 添加 loadConfig 函数
+func loadConfig(filename string) (*Config, error) {
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("读取配置文件失败: %v", err)
+	}
+
+	var config Config
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("解析配置文件失败: %v", err)
+	}
+
+	return &config, nil
 }
 
 func main() {
@@ -43,11 +63,11 @@ func main() {
 	var migration Migration
 	switch *migrationType {
 	case "cassandra":
-		migration, err = NewCassandraMigration(config)
+		migration, err = cassandra.NewMigration(config)
 	case "mysql":
-		migration, err = NewMySQLMigration(config)
+		migration, err = mysql.NewMigration(config)
 	case "mongodb":
-		migration, err = NewMongoDBMigration(config)
+		migration, err = mongodb.NewMigration(config)
 	default:
 		logrus.Fatalf("不支持的迁移类型: %s", *migrationType)
 	}

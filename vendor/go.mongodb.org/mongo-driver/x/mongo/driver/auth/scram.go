@@ -14,12 +14,11 @@ package auth
 
 import (
 	"context"
-	"net/http"
+	"fmt"
 
 	"github.com/xdg-go/scram"
 	"github.com/xdg-go/stringprep"
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
-	"go.mongodb.org/mongo-driver/x/mongo/driver"
 )
 
 const (
@@ -37,11 +36,7 @@ var (
 	)
 )
 
-func newScramSHA1Authenticator(cred *Cred, _ *http.Client) (Authenticator, error) {
-	source := cred.Source
-	if source == "" {
-		source = "admin"
-	}
+func newScramSHA1Authenticator(cred *Cred) (Authenticator, error) {
 	passdigest := mongoPasswordDigest(cred.Username, cred.Password)
 	client, err := scram.SHA1.NewClientUnprepped(cred.Username, passdigest, "")
 	if err != nil {
@@ -50,19 +45,15 @@ func newScramSHA1Authenticator(cred *Cred, _ *http.Client) (Authenticator, error
 	client.WithMinIterations(4096)
 	return &ScramAuthenticator{
 		mechanism: SCRAMSHA1,
-		source:    source,
+		source:    cred.Source,
 		client:    client,
 	}, nil
 }
 
-func newScramSHA256Authenticator(cred *Cred, _ *http.Client) (Authenticator, error) {
-	source := cred.Source
-	if source == "" {
-		source = "admin"
-	}
+func newScramSHA256Authenticator(cred *Cred) (Authenticator, error) {
 	passprep, err := stringprep.SASLprep.Prepare(cred.Password)
 	if err != nil {
-		return nil, newAuthError("error SASLprepping password", err)
+		return nil, newAuthError(fmt.Sprintf("error SASLprepping password '%s'", cred.Password), err)
 	}
 	client, err := scram.SHA256.NewClientUnprepped(cred.Username, passprep, "")
 	if err != nil {
@@ -71,7 +62,7 @@ func newScramSHA256Authenticator(cred *Cred, _ *http.Client) (Authenticator, err
 	client.WithMinIterations(4096)
 	return &ScramAuthenticator{
 		mechanism: SCRAMSHA256,
-		source:    source,
+		source:    cred.Source,
 		client:    client,
 	}, nil
 }
@@ -92,11 +83,6 @@ func (a *ScramAuthenticator) Auth(ctx context.Context, cfg *Config) error {
 		return newAuthError("sasl conversation error", err)
 	}
 	return nil
-}
-
-// Reauth reauthenticates the connection.
-func (a *ScramAuthenticator) Reauth(_ context.Context, _ *driver.AuthConfig) error {
-	return newAuthError("SCRAM does not support reauthentication", nil)
 }
 
 // CreateSpeculativeConversation creates a speculative conversation for SCRAM authentication.
@@ -127,7 +113,7 @@ func (a *scramSaslAdapter) Start() (string, []byte, error) {
 	return a.mechanism, []byte(step), nil
 }
 
-func (a *scramSaslAdapter) Next(_ context.Context, challenge []byte) ([]byte, error) {
+func (a *scramSaslAdapter) Next(challenge []byte) ([]byte, error) {
 	step, err := a.conversation.Step(string(challenge))
 	if err != nil {
 		return nil, err

@@ -25,7 +25,6 @@ import (
 
 // Find performs a find operation.
 type Find struct {
-	authenticator       driver.Authenticator
 	allowDiskUse        *bool
 	allowPartialResults *bool
 	awaitData           *bool
@@ -63,7 +62,6 @@ type Find struct {
 	result              driver.CursorResponse
 	serverAPI           *driver.ServerAPIOptions
 	timeout             *time.Duration
-	omitCSOTMaxTimeMS   bool
 	logger              *logger.Logger
 }
 
@@ -112,8 +110,6 @@ func (f *Find) Execute(ctx context.Context) error {
 		Timeout:           f.timeout,
 		Logger:            f.logger,
 		Name:              driverutil.FindOp,
-		OmitCSOTMaxTimeMS: f.omitCSOTMaxTimeMS,
-		Authenticator:     f.authenticator,
 	}.Execute(ctx)
 
 }
@@ -556,18 +552,6 @@ func (f *Find) Timeout(timeout *time.Duration) *Find {
 	return f
 }
 
-// OmitCSOTMaxTimeMS omits the automatically-calculated "maxTimeMS" from the
-// command when CSOT is enabled. It does not effect "maxTimeMS" set by
-// [Find.MaxTime].
-func (f *Find) OmitCSOTMaxTimeMS(omit bool) *Find {
-	if f == nil {
-		f = new(Find)
-	}
-
-	f.omitCSOTMaxTimeMS = omit
-	return f
-}
-
 // Logger sets the logger for this operation.
 func (f *Find) Logger(logger *logger.Logger) *Find {
 	if f == nil {
@@ -575,15 +559,5 @@ func (f *Find) Logger(logger *logger.Logger) *Find {
 	}
 
 	f.logger = logger
-	return f
-}
-
-// Authenticator sets the authenticator to use for this operation.
-func (f *Find) Authenticator(authenticator driver.Authenticator) *Find {
-	if f == nil {
-		f = new(Find)
-	}
-
-	f.authenticator = authenticator
 	return f
 }

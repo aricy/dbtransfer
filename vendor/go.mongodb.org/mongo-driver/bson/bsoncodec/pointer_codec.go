@@ -18,16 +18,8 @@ var _ ValueDecoder = &PointerCodec{}
 
 // PointerCodec is the Codec used for pointers.
 //
-// Deprecated: PointerCodec will not be directly accessible in Go Driver 2.0. To
-// override the default pointer encode and decode behavior, create a new registry
-// with [go.mongodb.org/mongo-driver/bson.NewRegistry] and register a new
-// encoder and decoder for pointers.
-//
-// For example,
-//
-//	reg := bson.NewRegistry()
-//	reg.RegisterKindEncoder(reflect.Ptr, myPointerEncoder)
-//	reg.RegisterKindDecoder(reflect.Ptr, myPointerDecoder)
+// Deprecated: Use [go.mongodb.org/mongo-driver/bson.NewRegistry] to get a registry with the
+// PointerCodec registered.
 type PointerCodec struct {
 	ecache typeEncoderCache
 	dcache typeDecoderCache
@@ -35,8 +27,8 @@ type PointerCodec struct {
 
 // NewPointerCodec returns a PointerCodec that has been initialized.
 //
-// Deprecated: NewPointerCodec will not be available in Go Driver 2.0. See
-// [PointerCodec] for more details.
+// Deprecated: Use [go.mongodb.org/mongo-driver/bson.NewRegistry] to get a registry with the
+// PointerCodec registered.
 func NewPointerCodec() *PointerCodec {
 	return &PointerCodec{}
 }

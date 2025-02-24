@@ -182,17 +182,7 @@ func (writeServerSelector) SelectServer(t Topology, candidates []Server) ([]Serv
 	case Single, LoadBalanced:
 		return candidates, nil
 	default:
-		// Determine the capacity of the results slice.
-		selected := 0
-		for _, candidate := range candidates {
-			switch candidate.Kind {
-			case Mongos, RSPrimary, Standalone:
-				selected++
-			}
-		}
-
-		// Append candidates to the results slice.
-		result := make([]Server, 0, selected)
+		result := []Server{}
 		for _, candidate := range candidates {
 			switch candidate.Kind {
 			case Mongos, RSPrimary, Standalone:

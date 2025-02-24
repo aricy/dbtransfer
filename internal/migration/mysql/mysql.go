@@ -1,4 +1,4 @@
-package main
+package mysql
 
 import (
 	"context"
@@ -15,28 +15,47 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
+
+	"dbtransfer/internal/config"
+	"dbtransfer/internal/migration"
 )
 
 type MySQLMigration struct {
 	source     *sql.DB
 	dest       *sql.DB
-	config     *Config
+	config     *config.Config
 	limiter    *rate.Limiter
-	stats      *MigrationStats
+	stats      *migration.MigrationStats
 	maxRetries int
 	retryDelay time.Duration
 	lastID     int64 // 记录最后处理的ID
 }
 
-func NewMySQLMigration(config *Config) (*MySQLMigration, error) {
-	// 连接源数据库
-	sourceDB, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s",
+func NewMigration(config *config.Config) (migration.Migration, error) {
+	// 检查配置
+	if len(config.Source.Hosts) == 0 || len(config.Destination.Hosts) == 0 {
+		return nil, fmt.Errorf("未配置数据库主机地址")
+	}
+
+	sourceConnStr := fmt.Sprintf("%s:%s@tcp(%s)/%s",
 		config.Source.Username,
 		config.Source.Password,
 		config.Source.Hosts[0],
-		config.Source.Database))
+		config.Source.Database)
+	logrus.Infof("正在连接源数据库: %s", strings.Replace(sourceConnStr, config.Source.Password, "****", 1))
+
+	// 连接源数据库
+	sourceDB, err := sql.Open("mysql", sourceConnStr)
 	if err != nil {
+		logrus.Errorf("连接源数据库失败: %v", err)
 		return nil, fmt.Errorf("连接源数据库失败: %v", err)
+	}
+
+	// 测试连接
+	if err = sourceDB.Ping(); err != nil {
+		sourceDB.Close()
+		logrus.Errorf("源数据库连接测试失败: %v", err)
+		return nil, fmt.Errorf("源数据库连接测试失败: %v", err)
 	}
 
 	// 连接目标数据库
@@ -57,12 +76,13 @@ func NewMySQLMigration(config *Config) (*MySQLMigration, error) {
 		limiter = rate.NewLimiter(rate.Limit(config.Migration.RateLimit), 1)
 	}
 
+	logrus.Info("数据库连接成功")
 	return &MySQLMigration{
 		source:     sourceDB,
 		dest:       destDB,
 		config:     config,
 		limiter:    limiter,
-		stats:      &MigrationStats{StartTime: time.Now()},
+		stats:      &migration.MigrationStats{StartTime: time.Now()},
 		maxRetries: 3,
 		retryDelay: time.Second * 5,
 	}, nil
@@ -85,7 +105,7 @@ func (m *MySQLMigration) Run(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second * 5)
 	go func() {
 		for range ticker.C {
-			m.stats.report()
+			m.stats.Report()
 		}
 	}()
 	defer ticker.Stop()
@@ -93,7 +113,7 @@ func (m *MySQLMigration) Run(ctx context.Context) error {
 	// 并发迁移表
 	for _, table := range m.config.Source.Tables {
 		wg.Add(1)
-		go func(table TableMapping) {
+		go func(table config.TableMapping) {
 			defer wg.Done()
 			if err := m.migrateTable(ctx, table); err != nil {
 				errChan <- fmt.Errorf("迁移表 %s 失败: %v", table.Name, err)
@@ -115,11 +135,11 @@ func (m *MySQLMigration) Run(ctx context.Context) error {
 		return fmt.Errorf("迁移过程中发生错误:\n%s", strings.Join(errors, "\n"))
 	}
 
-	m.stats.report() // 最终报告
+	m.stats.Report() // 最终报告
 	return nil
 }
 
-func (m *MySQLMigration) migrateTable(ctx context.Context, table TableMapping) error {
+func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMapping) error {
 	logrus.Infof("开始迁移表: %s", table.Name)
 
 	// 首先检查表是否存在
@@ -267,13 +287,13 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table TableMapping) e
 		}
 
 		// 更新进度
-		m.stats.increment(count)
+		m.stats.Increment(count)
 		m.lastID = maxID
 		lastID = maxID
 	}
 
 	// 最终报告
-	m.stats.report()
+	m.stats.Report()
 	logrus.Infof("表 %s 迁移完成并已保存完成标记", table.Name)
 	return nil
 }
@@ -401,7 +421,7 @@ func min(a, b int) int {
 }
 
 // 添加断点相关方法
-func (m *MySQLMigration) loadCheckpoint(tableName string) (*Checkpoint, error) {
+func (m *MySQLMigration) loadCheckpoint(tableName string) (*migration.Checkpoint, error) {
 	if m.config.Migration.CheckpointDir == "" {
 		return nil, nil
 	}
@@ -417,7 +437,7 @@ func (m *MySQLMigration) loadCheckpoint(tableName string) (*Checkpoint, error) {
 		return nil, err
 	}
 
-	var checkpoint Checkpoint
+	var checkpoint migration.Checkpoint
 	if err := json.Unmarshal(data, &checkpoint); err != nil {
 		return nil, err
 	}
@@ -430,7 +450,7 @@ func (m *MySQLMigration) saveCheckpoint(tableName string, lastKey map[string]str
 		return nil
 	}
 
-	checkpoint := &Checkpoint{
+	checkpoint := &migration.Checkpoint{
 		LastKey:     lastKey,
 		LastUpdated: time.Now(),
 		Complete:    completed,
@@ -505,9 +525,6 @@ func (m *MySQLMigration) processBatch(rows *sql.Rows, batchSize int) ([]interfac
 
 	return batch, count, maxID, nil
 }
-
-
-// 其他 MySQL 迁移相关的方法...
 
 func init() {
 	// 设置日志格式
