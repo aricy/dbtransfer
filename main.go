@@ -4,12 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 
+	"dbtransfer/internal/config"
 	"dbtransfer/internal/migration"
 	"dbtransfer/internal/migration/cassandra"
 	"dbtransfer/internal/migration/mongodb"
@@ -22,18 +23,31 @@ const VERSION = "0.1"
 type Migration = migration.Migration
 
 // 添加 loadConfig 函数
-func loadConfig(filename string) (*Config, error) {
-	data, err := ioutil.ReadFile(filename)
+func loadConfig(filename string) (*config.Config, error) {
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf("读取配置文件失败: %v", err)
 	}
 
-	var config Config
-	if err := yaml.Unmarshal(data, &config); err != nil {
+	var cfg config.Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("解析配置文件失败: %v", err)
 	}
 
-	return &config, nil
+	// 设置默认值
+	cfg.Migration.SetDefaults()
+
+	// 创建必要的目录
+	if err := migration.EnsureDir(cfg.Migration.CheckpointDir); err != nil {
+		return nil, err
+	}
+	if cfg.Migration.LogFile != "" {
+		if err := migration.EnsureDir(filepath.Dir(cfg.Migration.LogFile)); err != nil {
+			return nil, err
+		}
+	}
+
+	return &cfg, nil
 }
 
 func main() {

@@ -450,7 +450,7 @@ func (m *MySQLMigration) loadCheckpoint(tableName string) (*migration.Checkpoint
 	}
 
 	filename := filepath.Join(m.config.Migration.CheckpointDir,
-		fmt.Sprintf("%s.checkpoint", tableName))
+		fmt.Sprintf("mysql_%s.checkpoint", tableName))
 
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -485,7 +485,7 @@ func (m *MySQLMigration) saveCheckpoint(tableName string, lastKey map[string]str
 	}
 
 	filename := filepath.Join(m.config.Migration.CheckpointDir,
-		fmt.Sprintf("%s.checkpoint", tableName))
+		fmt.Sprintf("mysql_%s.checkpoint", tableName))
 
 	return os.WriteFile(filename, data, 0644)
 }

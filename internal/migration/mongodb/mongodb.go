@@ -489,7 +489,7 @@ func (m *MongoDBMigration) loadCheckpoint(tableName string) (*migration.Checkpoi
 	}
 
 	filename := filepath.Join(m.config.Migration.CheckpointDir,
-		fmt.Sprintf("%s.checkpoint", tableName))
+		fmt.Sprintf("mongodb_%s.checkpoint", tableName))
 
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -524,7 +524,7 @@ func (m *MongoDBMigration) saveCheckpoint(tableName string, lastKey map[string]s
 	}
 
 	filename := filepath.Join(m.config.Migration.CheckpointDir,
-		fmt.Sprintf("%s.checkpoint", tableName))
+		fmt.Sprintf("mongodb_%s.checkpoint", tableName))
 
 	return os.WriteFile(filename, data, 0644)
 }

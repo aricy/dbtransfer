@@ -138,3 +138,11 @@ func InitLogger(logFile string, logLevel string) error {
 
 	return nil
 }
+
+// 确保目录存在
+func EnsureDir(dir string) error {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("创建目录失败 %s: %v", dir, err)
+	}
+	return nil
+}

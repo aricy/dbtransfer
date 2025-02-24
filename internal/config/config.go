@@ -32,3 +32,31 @@ type MigrationConfig struct {
 	CheckpointDelay  int    `yaml:"checkpoint_delay"`
 	ProgressInterval int    `yaml:"progress_interval"`
 }
+
+// 设置默认配置
+func (c *MigrationConfig) SetDefaults() {
+	if c.BatchSize <= 0 {
+		c.BatchSize = 1000
+	}
+	if c.Workers <= 0 {
+		c.Workers = 4
+	}
+	if c.RateLimit <= 0 {
+		c.RateLimit = 10000
+	}
+	if c.Timeout <= 0 {
+		c.Timeout = 30
+	}
+	if c.CheckpointDir == "" {
+		c.CheckpointDir = "./data/checkpoints"
+	}
+	if c.CheckpointDelay <= 0 {
+		c.CheckpointDelay = 60
+	}
+	if c.ProgressInterval <= 0 {
+		c.ProgressInterval = 5
+	}
+	if c.LogLevel == "" {
+		c.LogLevel = "info"
+	}
+}

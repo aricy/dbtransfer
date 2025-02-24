@@ -885,7 +885,7 @@ func (m *CassandraMigration) loadCheckpointFile(tableName string) (*migration.Ch
 	}
 
 	filename := filepath.Join(m.config.Migration.CheckpointDir,
-		fmt.Sprintf("%s.checkpoint", tableName))
+		fmt.Sprintf("cassandra_%s.checkpoint", tableName))
 
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -908,6 +908,11 @@ func (m *CassandraMigration) saveCheckpoint(tableName string, lastKey map[string
 		return nil
 	}
 
+	// 确保 checkpoint 目录存在
+	if err := migration.EnsureDir(m.config.Migration.CheckpointDir); err != nil {
+		return err
+	}
+
 	checkpoint := &migration.Checkpoint{
 		LastKey:     lastKey,
 		LastUpdated: time.Now(),
@@ -920,9 +925,8 @@ func (m *CassandraMigration) saveCheckpoint(tableName string, lastKey map[string
 	}
 
 	filename := filepath.Join(m.config.Migration.CheckpointDir,
-		fmt.Sprintf("%s.checkpoint", tableName))
+		fmt.Sprintf("cassandra_%s.checkpoint", tableName))
 
-	logrus.Infof("保存断点到文件 %s，checkpoint内容: %+v", filename, checkpoint)
 	return os.WriteFile(filename, data, 0644)
 }
 
