@@ -33,6 +33,11 @@ type MongoDBMigration struct {
 }
 
 func NewMigration(config *config.Config) (migration.Migration, error) {
+	// 初始化日志
+	if err := migration.InitLogger(config.Migration.LogFile, config.Migration.LogLevel); err != nil {
+		return nil, fmt.Errorf("初始化日志失败: %v", err)
+	}
+
 	ctx := context.Background()
 
 	// 连接源数据库
@@ -125,8 +130,23 @@ func (m *MongoDBMigration) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(m.config.Source.Tables))
 
-	// 启动进度报告，每5秒更新一次
-	ticker := time.NewTicker(time.Second * 5)
+	// 创建工作池
+	workers := m.config.Migration.Workers
+	if workers <= 0 {
+		workers = 4 // 默认值
+	}
+	semaphore := make(chan struct{}, workers)
+	logrus.Infof("使用 %d 个工作线程进行并发迁移", workers)
+
+	// 设置进度报告间隔
+	interval := time.Duration(m.config.Migration.ProgressInterval)
+	if interval <= 0 {
+		interval = 5 // 默认5秒
+	}
+	logrus.Infof("进度报告间隔: %d 秒", interval)
+
+	// 启动进度报告
+	ticker := time.NewTicker(time.Second * interval)
 	go func() {
 		for range ticker.C {
 			m.stats.Report()
@@ -137,8 +157,11 @@ func (m *MongoDBMigration) Run(ctx context.Context) error {
 	// 并发迁移集合
 	for _, table := range m.config.Source.Tables {
 		wg.Add(1)
+		// 获取信号量
+		semaphore <- struct{}{}
 		go func(table config.TableMapping) {
 			defer wg.Done()
+			defer func() { <-semaphore }() // 释放信号量
 			if err := m.migrateCollection(ctx, table); err != nil {
 				errChan <- fmt.Errorf("迁移集合 %s 失败: %v", table.Name, err)
 			}

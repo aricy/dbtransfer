@@ -22,9 +22,10 @@ destination:
 migration:
   batch_size: 1000        # 每批处理的记录数
   workers: 4              # 并发工作线程数
-  rate_limit: 5000        # 每秒处理的记录数限制
+  rate_limit: 10000       # 每秒处理的记录数限制
   timeout: 30             # 连接超时时间（秒）
   checkpoint_dir: "./checkpoints"  # 断点续传文件保存目录
   checkpoint_delay: 60    # 断点保存间隔（秒）
   log_file: "./migration.log"
   log_level: "info"
+  progress_interval: 5  # 进度报告间隔时间（秒）

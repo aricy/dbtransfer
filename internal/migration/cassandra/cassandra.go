@@ -27,14 +27,15 @@ type TableMapping struct {
 }
 
 type MigrationConfig struct {
-	BatchSize       int    `yaml:"batch_size"`
-	Workers         int    `yaml:"workers"`
-	RateLimit       int    `yaml:"rate_limit"`
-	Timeout         int    `yaml:"timeout"`
-	CheckpointDir   string `yaml:"checkpoint_dir"`
-	LogFile         string `yaml:"log_file"`
-	LogLevel        string `yaml:"log_level"`
-	CheckpointDelay int    `yaml:"checkpoint_delay"` // 单位：秒
+	BatchSize        int    `yaml:"batch_size"`
+	Workers          int    `yaml:"workers"`
+	RateLimit        int    `yaml:"rate_limit"`
+	Timeout          int    `yaml:"timeout"`
+	CheckpointDir    string `yaml:"checkpoint_dir"`
+	LogFile          string `yaml:"log_file"`
+	LogLevel         string `yaml:"log_level"`
+	CheckpointDelay  int    `yaml:"checkpoint_delay"`  // 单位：秒
+	ProgressInterval int    `yaml:"progress_interval"` // 进度报告间隔时间（秒）
 }
 
 type Config struct {
@@ -82,6 +83,11 @@ type TokenRange struct {
 }
 
 func NewMigration(config *config.Config) (migration.Migration, error) {
+	// 初始化日志
+	if err := migration.InitLogger(config.Migration.LogFile, config.Migration.LogLevel); err != nil {
+		return nil, fmt.Errorf("初始化日志失败: %v", err)
+	}
+
 	if config.Source.Keyspace == "" || config.Destination.Keyspace == "" {
 		return nil, fmt.Errorf("未配置 keyspace")
 	}
@@ -145,8 +151,23 @@ func (m *CassandraMigration) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(m.config.Source.Tables))
 
+	// 创建工作池
+	workers := m.config.Migration.Workers
+	if workers <= 0 {
+		workers = 4 // 默认值
+	}
+	semaphore := make(chan struct{}, workers)
+	logrus.Infof("使用 %d 个工作线程进行并发迁移", workers)
+
+	// 设置进度报告间隔
+	interval := time.Duration(m.config.Migration.ProgressInterval)
+	if interval <= 0 {
+		interval = 5 // 默认5秒
+	}
+	logrus.Infof("进度报告间隔: %d 秒", interval)
+
 	// 启动进度报告
-	ticker := time.NewTicker(time.Second * 10)
+	ticker := time.NewTicker(time.Second * interval)
 	go func() {
 		for range ticker.C {
 			m.stats.Report()
@@ -157,15 +178,17 @@ func (m *CassandraMigration) Run(ctx context.Context) error {
 	// 并发迁移表
 	for _, table := range m.config.Source.Tables {
 		wg.Add(1)
+		// 获取信号量
+		semaphore <- struct{}{}
 		go func(table config.TableMapping) {
 			defer wg.Done()
+			defer func() { <-semaphore }() // 释放信号量
 			if err := m.migrateTable(ctx, table); err != nil {
 				errChan <- fmt.Errorf("迁移表 %s 失败: %v", table.Name, err)
 			}
 		}(table)
 	}
 
-	// 等待所有迁移完成
 	wg.Wait()
 	close(errChan)
 
