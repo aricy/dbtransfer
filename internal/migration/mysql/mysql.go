@@ -174,6 +174,14 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 		return fmt.Errorf("表 %s 不存在", table.Name)
 	}
 
+	// 获取表的主键
+	primaryKey, err := m.getPrimaryKey(table.Name)
+	if err != nil {
+		logrus.Errorf("获取表 %s 的主键失败: %v", table.Name, err)
+		return fmt.Errorf("表 %s 必须有主键才能迁移", table.Name)
+	}
+	logrus.Infof("表 %s 使用主键: %s", table.Name, primaryKey)
+
 	// 首先检查断点
 	checkpoint, err := m.loadCheckpoint(table.Name)
 	if err != nil {
@@ -214,18 +222,18 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 	var totalRows int64
 	lastID := int64(0)
 	if checkpoint != nil {
-		if id, ok := checkpoint.LastKey["id"]; ok {
+		if id, ok := checkpoint.LastKey[primaryKey]; ok {
 			lastID, _ = strconv.ParseInt(id, 10, 64)
 		}
 	}
 
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE id > ?", table.Name)
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s > ?", table.Name, primaryKey)
 	if err := m.source.QueryRow(countQuery, lastID).Scan(&totalRows); err != nil {
 		return fmt.Errorf("获取总行数失败: %v", err)
 	}
 	m.stats.TotalRows = totalRows
 
-	logrus.Infof("总行数: %d (从ID %d 开始)", totalRows, lastID)
+	logrus.Infof("总行数: %d (从 %s=%d 开始)", totalRows, primaryKey, lastID)
 
 	// 创建断点保存计时器
 	checkpointTicker := time.NewTicker(time.Second) // 每秒保存一次断点
@@ -237,7 +245,7 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 			case <-ctx.Done():
 				return
 			case <-checkpointTicker.C:
-				if err := m.saveCheckpoint(table.Name, map[string]string{"id": strconv.FormatInt(lastID, 10)}, false); err != nil {
+				if err := m.saveCheckpoint(table.Name, map[string]string{primaryKey: strconv.FormatInt(lastID, 10)}, false); err != nil {
 					logrus.Warnf("保存断点失败: %v", err)
 				}
 			}
@@ -259,21 +267,21 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 
 	for {
 		// 查询数据
-		selectQuery := fmt.Sprintf("SELECT * FROM %s WHERE id > ? ORDER BY id LIMIT ?", table.Name)
+		selectQuery := fmt.Sprintf("SELECT * FROM %s WHERE %s > ? ORDER BY %s LIMIT ?", table.Name, primaryKey, primaryKey)
 		rows, err := m.source.Query(selectQuery, lastID, batchSize)
 		if err != nil {
 			return fmt.Errorf("查询数据失败: %v", err)
 		}
 
 		// 处理数据
-		batch, count, maxID, err := m.processBatch(rows, batchSize)
+		batch, count, maxID, err := m.processBatch(rows, batchSize, primaryKey)
 		rows.Close()
 		if err != nil {
 			return err
 		}
 
 		if count == 0 {
-			lastKey := map[string]string{"id": strconv.FormatInt(lastID, 10)}
+			lastKey := map[string]string{primaryKey: strconv.FormatInt(lastID, 10)}
 			if err := m.saveCheckpoint(table.Name, lastKey, true); err != nil {
 				logrus.Errorf("保存完成标记失败: %v", err)
 			} else {
@@ -485,27 +493,34 @@ func (m *MySQLMigration) saveCheckpoint(tableName string, lastKey map[string]str
 	return os.WriteFile(filename, data, 0644)
 }
 
-func (m *MySQLMigration) processBatch(rows *sql.Rows, batchSize int) ([]interface{}, int, int64, error) {
-	// 获取列信息
+func (m *MySQLMigration) processBatch(rows *sql.Rows, batchSize int, primaryKey string) ([]interface{}, int, int64, error) {
 	columns, err := rows.Columns()
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("获取列信息失败: %v", err)
 	}
 
-	// 准备批量数据
-	var batch []interface{}
-	count := 0
-	var maxID int64
-
-	for rows.Next() {
-		// 创建值的容器
-		values := make([]interface{}, len(columns))
-		scanArgs := make([]interface{}, len(columns))
-		for i := range values {
-			scanArgs[i] = &sql.RawBytes{} // 使用 RawBytes 来扫描数据
+	// 找到主键列的索引
+	primaryKeyIndex := 0
+	for i, col := range columns {
+		if col == primaryKey {
+			primaryKeyIndex = i
+			break
 		}
+	}
 
-		// 扫描行
+	count := 0
+	maxID := int64(0)
+	batch := make([]interface{}, 0, batchSize*len(columns))
+
+	// 准备扫描目标
+	values := make([]interface{}, len(columns))
+	scanArgs := make([]interface{}, len(columns))
+	for i := range values {
+		scanArgs[i] = &sql.RawBytes{}
+	}
+
+	// 遍历结果集
+	for rows.Next() {
 		if err := rows.Scan(scanArgs...); err != nil {
 			return nil, 0, 0, fmt.Errorf("扫描行失败: %v", err)
 		}
@@ -516,11 +531,11 @@ func (m *MySQLMigration) processBatch(rows *sql.Rows, batchSize int) ([]interfac
 			if rb == nil || len(*rb) == 0 {
 				values[i] = nil
 			} else {
-				// 对于第一列（ID），特殊处理
-				if i == 0 {
+				// 对于主键列，特殊处理
+				if i == primaryKeyIndex {
 					id, err := strconv.ParseInt(string(*rb), 10, 64)
 					if err != nil {
-						return nil, 0, 0, fmt.Errorf("解析ID失败: %v", err)
+						return nil, 0, 0, fmt.Errorf("解析主键 %s 失败: %v", primaryKey, err)
 					}
 					values[i] = id
 					if id > maxID {
@@ -542,6 +557,67 @@ func (m *MySQLMigration) processBatch(rows *sql.Rows, batchSize int) ([]interfac
 	}
 
 	return batch, count, maxID, nil
+}
+
+func (m *MySQLMigration) getPrimaryKey(tableName string) (string, error) {
+	query := fmt.Sprintf("SHOW KEYS FROM %s WHERE Key_name = 'PRIMARY'", tableName)
+	rows, err := m.source.Query(query)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var primaryKey string
+	// 使用更简单、更通用的方法获取主键
+	for rows.Next() {
+		// 创建一个动态大小的值数组
+		columns, err := rows.Columns()
+		if err != nil {
+			return "", err
+		}
+
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return "", err
+		}
+
+		// Column_name 通常是第5列（索引从1开始）
+		// 但为了安全起见，我们查找列名为 "Column_name" 的列
+		columnNameIndex := 4 // 默认位置
+		for i, colName := range columns {
+			if strings.EqualFold(colName, "Column_name") {
+				columnNameIndex = i
+				break
+			}
+		}
+
+		// 确保索引在范围内
+		if columnNameIndex < len(values) && values[columnNameIndex] != nil {
+			if colName, ok := values[columnNameIndex].([]byte); ok {
+				primaryKey = string(colName)
+				break
+			} else if colName, ok := values[columnNameIndex].(string); ok {
+				primaryKey = colName
+				break
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+
+	if primaryKey == "" {
+		return "", fmt.Errorf("表 %s 没有主键", tableName)
+	}
+
+	return primaryKey, nil
 }
 
 func init() {

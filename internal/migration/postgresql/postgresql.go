@@ -210,6 +210,14 @@ func (m *PostgreSQLMigration) migrateTable(ctx context.Context, table config.Tab
 	checkpointTicker := time.NewTicker(time.Second) // 每秒保存一次断点
 	defer checkpointTicker.Stop()
 
+	// 获取表的主键
+	primaryKey, err := m.getPrimaryKey(table.Name)
+	if err != nil {
+		logrus.Errorf("获取表 %s 的主键失败: %v", table.Name, err)
+		return fmt.Errorf("表 %s 必须有主键才能迁移", table.Name)
+	}
+	logrus.Infof("表 %s 使用主键: %s", table.Name, primaryKey)
+
 	// 检查断点
 	checkpoint, err := m.loadCheckpoint(table.Name)
 	if err != nil {
@@ -222,10 +230,10 @@ func (m *PostgreSQLMigration) migrateTable(ctx context.Context, table config.Tab
 	// 从断点恢复 lastID
 	var lastID int64
 	if checkpoint != nil && checkpoint.LastKey != nil {
-		if idStr, ok := checkpoint.LastKey["id"]; ok {
+		if idStr, ok := checkpoint.LastKey[primaryKey]; ok {
 			if id, err := strconv.ParseInt(idStr, 10, 64); err == nil {
 				lastID = id
-				logrus.Infof("从断点恢复，继续从 ID %d 开始迁移", lastID)
+				logrus.Infof("从断点恢复，继续从 %s=%d 开始迁移", primaryKey, lastID)
 			}
 		}
 	}
@@ -240,7 +248,7 @@ func (m *PostgreSQLMigration) migrateTable(ctx context.Context, table config.Tab
 	// 如果是从断点恢复，获取已迁移的行数
 	if lastID > 0 {
 		var completedRows int64
-		completedQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE id <= $1", table.Name)
+		completedQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s <= $1", table.Name, primaryKey)
 		if err := m.source.QueryRow(completedQuery, lastID).Scan(&completedRows); err != nil {
 			return fmt.Errorf("获取已完成行数失败: %v", err)
 		}
@@ -254,7 +262,7 @@ func (m *PostgreSQLMigration) migrateTable(ctx context.Context, table config.Tab
 		m.stats.TotalRows = totalRows
 	}
 
-	logrus.Infof("总行数: %d (从ID %d 开始)", totalRows, lastID)
+	logrus.Infof("总行数: %d (从 %s=%d 开始)", totalRows, primaryKey, lastID)
 	logrus.Infof("开始执行数据查询，批次大小: %d, 限速: %d 行/秒",
 		m.config.Migration.BatchSize, m.config.Migration.RateLimit)
 
@@ -278,14 +286,14 @@ func (m *PostgreSQLMigration) migrateTable(ctx context.Context, table config.Tab
 	// 开始迁移数据
 	for {
 		// 分批查询数据
-		query := fmt.Sprintf("SELECT * FROM %s WHERE id > $1 ORDER BY id LIMIT $2", table.Name)
+		query := fmt.Sprintf("SELECT * FROM %s WHERE %s > $1 ORDER BY %s LIMIT $2", table.Name, primaryKey, primaryKey)
 		rows, err := m.source.Query(query, lastID, m.config.Migration.BatchSize)
 		if err != nil {
 			return fmt.Errorf("查询数据失败: %v", err)
 		}
 
 		// 处理批次数据
-		batch, count, maxID, err := m.processBatch(rows)
+		batch, count, maxID, err := m.processBatch(rows, primaryKey)
 		rows.Close()
 		if err != nil {
 			return err
@@ -307,7 +315,7 @@ func (m *PostgreSQLMigration) migrateTable(ctx context.Context, table config.Tab
 		// 检查是否需要保存断点
 		select {
 		case <-checkpointTicker.C:
-			if err := m.saveCheckpoint(table.Name, map[string]string{"id": strconv.FormatInt(lastID, 10)}, false); err != nil {
+			if err := m.saveCheckpoint(table.Name, map[string]string{primaryKey: strconv.FormatInt(lastID, 10)}, false); err != nil {
 				logrus.Warnf("保存断点失败: %v", err)
 			}
 		default:
@@ -315,7 +323,7 @@ func (m *PostgreSQLMigration) migrateTable(ctx context.Context, table config.Tab
 	}
 
 	// 标记完成
-	if err := m.saveCheckpoint(table.Name, map[string]string{"id": strconv.FormatInt(lastID, 10)}, true); err != nil {
+	if err := m.saveCheckpoint(table.Name, map[string]string{primaryKey: strconv.FormatInt(lastID, 10)}, true); err != nil {
 		logrus.Warnf("保存完成标记失败: %v", err)
 	}
 
@@ -384,35 +392,71 @@ func (m *PostgreSQLMigration) getTableSchema(tableName string) (string, error) {
 }
 
 // 处理批次数据
-func (m *PostgreSQLMigration) processBatch(rows *sql.Rows) ([]interface{}, int, int64, error) {
+func (m *PostgreSQLMigration) processBatch(rows *sql.Rows, primaryKey string) ([]interface{}, int, int64, error) {
 	// 获取列信息
-	columns, err := rows.Columns()
+	columns, err := rows.ColumnTypes()
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("获取列信息失败: %v", err)
 	}
 
-	// 准备批量数据
-	var batch []interface{}
-	count := 0
-	var maxID int64
-
-	// 准备扫描目标
-	values := make([]interface{}, len(columns))
-	scanArgs := make([]interface{}, len(columns))
-	for i := range values {
-		scanArgs[i] = &values[i]
+	// 找到主键列的索引
+	primaryKeyIndex := -1
+	for i, col := range columns {
+		if col.Name() == primaryKey {
+			primaryKeyIndex = i
+			break
+		}
 	}
 
+	if primaryKeyIndex == -1 {
+		return nil, 0, 0, fmt.Errorf("未找到主键列 %s", primaryKey)
+	}
+
+	// 准备批量数据
+	var batch []interface{}
+	var count int
+	var maxID int64
+
+	// 遍历结果集
 	for rows.Next() {
-		// 扫描行
-		if err := rows.Scan(scanArgs...); err != nil {
+		// 创建一个值的切片来保存行数据
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+
+		// 为每一列创建一个指针
+		for i := range columns {
+			valuePtrs[i] = &values[i]
+		}
+
+		// 扫描行到值指针
+		if err := rows.Scan(valuePtrs...); err != nil {
 			return nil, 0, 0, fmt.Errorf("扫描行失败: %v", err)
 		}
 
-		// 处理ID列
-		if id, ok := values[0].(int64); ok {
+		// 处理主键值
+		if id, ok := values[primaryKeyIndex].(int64); ok {
 			if id > maxID {
 				maxID = id
+			}
+		} else {
+			// 尝试转换其他类型到int64
+			switch v := values[primaryKeyIndex].(type) {
+			case int:
+				if int64(v) > maxID {
+					maxID = int64(v)
+				}
+			case int32:
+				if int64(v) > maxID {
+					maxID = int64(v)
+				}
+			case string:
+				if id, err := strconv.ParseInt(v, 10, 64); err == nil {
+					if id > maxID {
+						maxID = id
+					}
+				}
+			default:
+				return nil, 0, 0, fmt.Errorf("无法处理主键类型: %T", values[primaryKeyIndex])
 			}
 		}
 
@@ -435,44 +479,43 @@ func (m *PostgreSQLMigration) insertBatch(ctx context.Context, tableName string,
 	}
 
 	// 获取列信息
-	var columns []string
-	query := `
-		SELECT column_name 
-		FROM information_schema.columns 
-		WHERE table_name = $1 
-		ORDER BY ordinal_position;
-	`
-	rows, err := m.source.Query(query, tableName)
+	columns, err := m.getColumns(tableName)
 	if err != nil {
 		return fmt.Errorf("获取列信息失败: %v", err)
 	}
-	defer rows.Close()
 
-	for rows.Next() {
-		var column string
-		if err := rows.Scan(&column); err != nil {
-			return fmt.Errorf("读取列名失败: %v", err)
-		}
-		columns = append(columns, column)
+	// 获取主键
+	primaryKey, err := m.getPrimaryKey(tableName)
+	if err != nil {
+		logrus.Warnf("获取表 %s 的主键失败: %v，将使用默认主键 'id'", tableName, err)
+		primaryKey = "id"
 	}
 
-	// 构建插入语句
+	// 构建批量插入语句
 	rowCount := len(batch) / len(columns)
-	valueStrings := make([]string, rowCount)
+	valueStrings := make([]string, 0, rowCount)
+	valueArgs := make([]interface{}, 0, len(batch))
+
 	for i := 0; i < rowCount; i++ {
-		placeholders := make([]string, len(columns))
+		valueParams := make([]string, len(columns))
 		for j := range columns {
-			placeholders[j] = fmt.Sprintf("$%d", i*len(columns)+j+1)
+			valueParams[j] = fmt.Sprintf("$%d", i*len(columns)+j+1)
 		}
-		valueStrings[i] = "(" + strings.Join(placeholders, ", ") + ")"
+		valueStrings = append(valueStrings, fmt.Sprintf("(%s)", strings.Join(valueParams, ", ")))
+
+		// 添加参数
+		for j := 0; j < len(columns); j++ {
+			valueArgs = append(valueArgs, batch[i*len(columns)+j])
+		}
 	}
 
 	insertSQL := fmt.Sprintf(
-		"INSERT INTO %s (%s) VALUES %s ON CONFLICT (id) DO UPDATE SET %s",
+		"INSERT INTO %s (%s) VALUES %s ON CONFLICT (%s) DO UPDATE SET %s",
 		tableName,
 		strings.Join(columns, ", "),
 		strings.Join(valueStrings, ", "),
-		buildUpdateClause(columns),
+		primaryKey,
+		buildUpdateClause(columns, primaryKey),
 	)
 
 	// 执行批量插入
@@ -493,7 +536,7 @@ func (m *PostgreSQLMigration) insertBatch(ctx context.Context, tableName string,
 
 	// 执行插入
 	for i := 0; i < m.maxRetries; i++ {
-		_, err := m.dest.ExecContext(ctx, insertSQL, batch...)
+		_, err := m.dest.ExecContext(ctx, insertSQL, valueArgs...)
 		if err == nil {
 			return nil
 		}
@@ -509,10 +552,10 @@ func (m *PostgreSQLMigration) insertBatch(ctx context.Context, tableName string,
 }
 
 // 构建更新子句
-func buildUpdateClause(columns []string) string {
+func buildUpdateClause(columns []string, primaryKey string) string {
 	updates := make([]string, 0, len(columns))
 	for _, col := range columns {
-		if col != "id" { // 跳过主键
+		if col != primaryKey { // 跳过主键
 			updates = append(updates, fmt.Sprintf("%s = EXCLUDED.%s", col, col))
 		}
 	}
@@ -576,4 +619,57 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// 添加一个函数来获取表的主键
+func (m *PostgreSQLMigration) getPrimaryKey(tableName string) (string, error) {
+	query := `
+		SELECT a.attname
+		FROM   pg_index i
+		JOIN   pg_attribute a ON a.attrelid = i.indrelid
+								AND a.attnum = ANY(i.indkey)
+		WHERE  i.indrelid = $1::regclass
+		AND    i.indisprimary;
+	`
+
+	var primaryKey string
+	err := m.source.QueryRow(query, tableName).Scan(&primaryKey)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", fmt.Errorf("表 %s 没有主键", tableName)
+		}
+		return "", err
+	}
+
+	return primaryKey, nil
+}
+
+// 添加获取列信息的方法
+func (m *PostgreSQLMigration) getColumns(tableName string) ([]string, error) {
+	query := `
+		SELECT column_name 
+		FROM information_schema.columns 
+		WHERE table_name = $1 
+		ORDER BY ordinal_position;
+	`
+	rows, err := m.source.Query(query, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("查询列信息失败: %v", err)
+	}
+	defer rows.Close()
+
+	var columns []string
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			return nil, fmt.Errorf("读取列名失败: %v", err)
+		}
+		columns = append(columns, column)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return columns, nil
 }
