@@ -51,17 +51,179 @@ func loadConfig(filename string) (*config.Config, error) {
 	return &cfg, nil
 }
 
+// 生成配置文件模板
+func generateConfigTemplate(dbType, outputFile string) error {
+	var template string
+
+	switch dbType {
+	case "mysql":
+		template = `source:
+  type: mysql
+  hosts:
+    - "localhost:3306"
+  database: "source_db"
+  username: "root"
+  password: "password"
+  tables:
+    - name: "table1"
+      target_name: "table1_new"
+    - name: "table2"
+
+destination:
+  type: mysql
+  hosts:
+    - "localhost:3306"
+  database: "dest_db"
+  username: "root"
+  password: "password"
+
+migration:
+  batch_size: 1000
+  workers: 4
+  rate_limit: 10000
+  timeout: 30
+  checkpoint_dir: "./data/checkpoints"
+  log_file: "./logs/migration.log"
+  log_level: "info"
+  progress_interval: 10
+ `
+	case "postgresql":
+		template = `source:
+  type: postgresql
+  hosts:
+    - "localhost:5432"
+  database: "source_db"
+  schema: "public"
+  username: "postgres"
+  password: "password"
+  tables:
+    - name: "table1"
+      target_name: "table1_new"
+    - name: "table2"
+
+destination:
+  type: postgresql
+  hosts:
+    - "localhost:5432"
+  database: "dest_db"
+  schema: "public"
+  username: "postgres"
+  password: "password"
+
+migration:
+  batch_size: 1000
+  workers: 4
+  rate_limit: 10000
+  timeout: 30
+  checkpoint_dir: "./data/checkpoints"
+  log_file: "./logs/migration.log"
+  log_level: "info"
+  progress_interval: 10
+ `
+	case "mongodb":
+		template = `source:
+  type: mongodb
+  hosts:
+    - "localhost:27017"
+  database: "source_db"
+  username: "admin"
+  password: "password"
+  tables:
+    - name: "collection1"
+      target_name: "collection1_new"
+    - name: "collection2"
+
+destination:
+  type: mongodb
+  hosts:
+    - "localhost:27017"
+  database: "dest_db"
+  username: "admin"
+  password: "password"
+
+migration:
+  batch_size: 500
+  workers: 4
+  rate_limit: 2000
+  timeout: 30
+  checkpoint_dir: "./data/checkpoints"
+  log_file: "./logs/migration.log"
+  log_level: "info"
+  progress_interval: 10
+ `
+	case "cassandra":
+		template = `source:
+  type: cassandra
+  hosts:
+    - "localhost:9042"
+  keyspace: "source_keyspace"
+  username: "cassandra"
+  password: "cassandra"
+  tables:
+    - name: "table1"
+      target_name: "table1_new"
+    - name: "table2"
+
+destination:
+  type: cassandra
+  hosts:
+    - "localhost:9042"
+  keyspace: "dest_keyspace"
+  username: "cassandra"
+  password: "cassandra"
+
+migration:
+  batch_size: 1000
+  workers: 8
+  rate_limit: 5000
+  timeout: 30
+  checkpoint_dir: "./data/checkpoints"
+  log_file: "./logs/migration.log"
+  log_level: "info"
+  progress_interval: 10
+ `
+	default:
+		return fmt.Errorf("不支持的数据库类型: %s", dbType)
+	}
+
+	// 确保目录存在
+	dir := filepath.Dir(outputFile)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("创建目录失败: %v", err)
+		}
+	}
+
+	// 写入文件
+	if err := os.WriteFile(outputFile, []byte(template), 0644); err != nil {
+		return fmt.Errorf("写入配置模板失败: %v", err)
+	}
+
+	fmt.Printf("配置模板已生成: %s\n", outputFile)
+	return nil
+}
+
 func main() {
 	// 添加版本标志
 	var showVersion bool
 	flag.BoolVar(&showVersion, "version", false, "显示版本信息")
 	configFile := flag.String("config", "config.yaml", "配置文件路径")
 	migrationType := flag.String("type", "cassandra", "迁移类型: cassandra/mysql/mongodb/postgresql")
+	generateTemplate := flag.Bool("generate-template", false, "生成配置文件模板")
+	templateOutput := flag.String("template-output", "config.yaml", "配置模板输出路径")
 	flag.Parse()
 
 	// 如果指定了 version 标志，显示版本信息并退出
 	if showVersion {
 		fmt.Printf("DB Migration Tool v%s\n", VERSION)
+		os.Exit(0)
+	}
+
+	// 如果指定了生成模板标志
+	if *generateTemplate {
+		if err := generateConfigTemplate(*migrationType, *templateOutput); err != nil {
+			logrus.Fatalf("生成配置模板失败: %v", err)
+		}
 		os.Exit(0)
 	}
 
