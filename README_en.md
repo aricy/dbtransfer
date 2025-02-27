@@ -1,4 +1,4 @@
-# Database Migration Tool
+# A tool for migrating data between databases of the same type.
 
 ## Overview
 
@@ -6,53 +6,97 @@ This tool is designed for data migration between different database systems, sup
 
 ## Features
 
-- **Multiple Database Support**: MySQL, PostgreSQL, MongoDB, Cassandra
-- **Checkpoint Resumption**: Continue migration from the last position after interruption
-- **Concurrency Control**: Configurable number of concurrent worker threads
-- **Rate Limiting**: Prevent excessive pressure on source databases during migration
-- **Real-time Progress Reporting**: Periodic display of migration progress and rate
-- **Primary Key Detection**: Automatically detect and use table primary keys for checkpoints
+- Supported database types:
+  - MongoDB
+  - MySQL
+  - PostgreSQL
+  - Cassandra
 
-## Installation 
+Supports data migration between databases of the same type:
+  - MongoDB -> MongoDB
+  - MySQL -> MySQL
+  - PostgreSQL -> PostgreSQL
+  - Cassandra -> Cassandra
+  - Cassandra/ScyllaDB bidirectional migration (ScyllaDB is compatible with Cassandra protocol)
 
-## Configuration File
+Features:
+- Checkpoint resumption
+- Concurrent migration
+- Rate limiting
+- Progress reporting
+- Column data transformation
+- Internationalization
 
-The configuration file uses YAML format and includes settings for source database, destination database, and migration parameters.
+## Installation
 
-### Example Configuration (config.yaml) 
+### Building from Source
+
+The project uses Make to manage the build process. Available build commands:
+
+```bash
+# Build binary for current platform
+make build
+
+# Build for specific platforms
+make linux-amd64    # Build for Linux AMD64
+make linux-arm64    # Build for Linux ARM64
+make darwin-amd64   # Build for macOS AMD64
+make darwin-arm64   # Build for macOS ARM64
+
+# Build for all platforms
+make build-all
+
+# Other useful commands
+make clean          # Clean build files
+make test          # Run tests
+make fmt           # Format code
+make vet           # Run go vet
+make tidy          # Update dependencies
+make vendor        # Download dependencies to vendor directory
+```
+
+Built binaries will be placed in the `build` directory.
+
+## Configuration
+
+Example configuration (config.yaml):
 
 ```yaml
 source:
-  type: mysql  # Database type: mysql, postgresql, mongodb, cassandra
+  type: cassandra  # Database type: cassandra (also supports ScyllaDB)
   hosts:
-    - "localhost:3306"  # Database host address
-  database: "source_db"  # Database name
-  schema: "public"  # Schema for PostgreSQL
-  username: "root"
-  password: "password"
+    - 127.0.0.1:9042
+  keyspace: source_keyspace
+  username: cassandra
+  password: cassandra
   tables:
-    - name: "users"
-      target_name: "users_new"  # Optional, specify target table name
-    - name: "orders"
-    - name: "products"
+    - name: users
+      target_name: users_new
+    - name: orders
+      column_transformations:
+        - source_column: price
+          expression: "price * 100"  # Convert price unit
+        - source_column: status
+          expression: "UPPER(status)"  # Convert status to uppercase
 
 destination:
-  type: mysql
+  type: cassandra  # ScyllaDB uses the same type
   hosts:
-    - "localhost:3307"
-  database: "dest_db"
-  username: "root"
-  password: "password"
+    - 127.0.0.1:9042
+  keyspace: target_keyspace
+  username: cassandra
+  password: cassandra
 
 migration:
-  batch_size: 1000        # Number of records per batch
-  workers: 4              # Number of concurrent worker threads
-  rate_limit: 10000       # Rate limit (records per second)
-  timeout: 30             # Connection timeout (seconds)
-  checkpoint_dir: "./data/checkpoints"  # Directory for checkpoint files
-  log_file: "./logs/migration.log"  # Log file path
-  log_level: "info"       # Log level: debug, info, warn, error
-  progress_interval: 10   # Progress report interval (seconds)
+  workers: 4
+  batch_size: 1000
+  rate_limit: 5000
+  timeout: 30
+  checkpoint_dir: ./checkpoints
+  log_file: ./logs/migration.log
+  log_level: info
+  progress_interval: 5
+  language: en  # Optional: zh (Chinese) or en (English), auto-detect if not set
 ```
 
 ## Usage
@@ -197,3 +241,7 @@ migration:
 ## Contribution and Support
 
 For issues or suggestions, please submit an Issue or Pull Request.
+
+## License
+
+MIT

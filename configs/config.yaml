@@ -1,16 +1,24 @@
 source:
+  type: mysql
   hosts:
-    - "localhost:27017"  # MongoDB/MySQL/Cassandra/PostgreSQL 的主机地址
-  database: "test_db"    # MySQL/MongoDB/PostgreSQL 的数据库名
-  schema: public # PostgreSQL 的 schema，默认public
-  keyspace: "test_ks"    # Cassandra 的 keyspace
+    - "localhost:3306"
+  database: "source_db"
   username: "root"
   password: "password"
   tables:
     - name: "users"
-      target_name: "users_new"  # 可选，指定目标表名
+      target_name: "users_new"
+      column_transformations:
+        - source_column: "name"
+          expression: "UPPER(name)"
+        - source_column: "price"
+          expression: "price * 100"
+        - source_column: "create_time"
+          expression: "DATE_FORMAT(create_time, '%Y-%m-%d')"
     - name: "orders"
-    - name: "products"
+      column_transformations:
+        - source_column: "status"
+          expression: "CONCAT('Status: ', status)"
 
 destination:
   hosts:
@@ -21,11 +29,12 @@ destination:
   password: "password"
 
 migration:
-  batch_size: 1000        # 每批处理的记录数
-  workers: 4              # 并发工作线程数
-  rate_limit: 10000       # 每秒处理的记录数限制
-  timeout: 30             # 连接超时时间（秒）
-  checkpoint_dir: "./data/checkpoints"  # 断点续传文件保存目录（默认）
-  log_file: "./data/logs/migration.log"  # 日志文件路径（默认）
+  batch_size: 1000        # Number of records per batch
+  workers: 4              # Number of concurrent worker threads
+  rate_limit: 10000       # Rate limit (records per second)
+  timeout: 30             # Connection timeout (seconds)
+  checkpoint_dir: "./data/checkpoints"  # Directory for checkpoint files (default)
+  log_file: "./data/logs/migration.log"  # Log file path (default)
   log_level: "info"
-  progress_interval: 5    # 进度报告间隔时间（秒）
+  progress_interval: 5    # Progress report interval (seconds)
+  language: "zh"         # Language setting: "zh" for Chinese, "en" for English

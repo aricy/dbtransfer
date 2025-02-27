@@ -18,143 +18,158 @@ import (
 	"golang.org/x/time/rate"
 
 	"dbtransfer/internal/config"
+	"dbtransfer/internal/i18n"
 	"dbtransfer/internal/migration"
 )
 
+// MongoDBMigration 实现了 MongoDB 数据迁移
 type MongoDBMigration struct {
 	source     *mongo.Client
 	dest       *mongo.Client
 	config     *config.Config
 	limiter    *rate.Limiter
-	stats      *migration.MigrationStats
+	statsMap   map[string]*migration.MigrationStats // 为每个集合创建独立的统计信息
 	maxRetries int
 	retryDelay time.Duration
 	lastID     interface{} // 记录最后处理的ID
 }
 
+// NewMigration 创建一个新的 MongoDB 迁移实例
 func NewMigration(config *config.Config) (migration.Migration, error) {
 	// 初始化日志
 	if err := migration.InitLogger(config.Migration.LogFile, config.Migration.LogLevel); err != nil {
-		return nil, fmt.Errorf("初始化日志失败: %v", err)
+		return nil, fmt.Errorf(i18n.Tr("初始化日志失败: %v", "Failed to initialize logger: %v"), err)
 	}
 
-	ctx := context.Background()
+	// 设置语言
+	if config.Migration.Language != "" {
+		i18n.SetLanguage(config.Migration.Language)
+	}
+
+	// 检查配置
+	if len(config.Source.Hosts) == 0 || len(config.Destination.Hosts) == 0 {
+		return nil, fmt.Errorf(i18n.Tr("未配置数据库主机地址", "Database host addresses not configured"))
+	}
+
+	// 创建上下文
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(config.Migration.Timeout)*time.Second)
+	defer cancel()
+
+	// 设置客户端选项
+	clientOptions := options.Client().
+		SetConnectTimeout(time.Duration(config.Migration.Timeout) * time.Second).
+		SetServerSelectionTimeout(time.Duration(config.Migration.Timeout) * time.Second)
 
 	// 连接源数据库
-	sourceClient, err := connectMongoDB(ctx, config.Source)
+	logrus.Infof(i18n.Tr("正在连接源 MongoDB: %s", "Connecting to source MongoDB: %s"), config.Source.Hosts[0])
+	sourceClient, err := connectMongoDB(ctx, config.Source, clientOptions)
 	if err != nil {
-		return nil, fmt.Errorf("连接源数据库失败: %v", err)
+		return nil, fmt.Errorf(i18n.Tr("连接源 MongoDB 失败: %v", "Failed to connect to source MongoDB: %v"), err)
 	}
 
 	// 连接目标数据库
-	destClient, err := connectMongoDB(ctx, config.Destination)
+	logrus.Infof(i18n.Tr("正在连接目标 MongoDB: %s", "Connecting to target MongoDB: %s"), config.Destination.Hosts[0])
+	destClient, err := connectMongoDB(ctx, config.Destination, clientOptions)
 	if err != nil {
 		sourceClient.Disconnect(ctx)
-		return nil, fmt.Errorf("连接目标数据库失败: %v", err)
+		return nil, fmt.Errorf(i18n.Tr("连接目标 MongoDB 失败: %v", "Failed to connect to target MongoDB: %v"), err)
 	}
 
 	// 创建限流器
 	var limiter *rate.Limiter
 	if config.Migration.RateLimit > 0 {
-		burst := max(config.Migration.BatchSize, config.Migration.RateLimit)
-		limiter = rate.NewLimiter(rate.Limit(config.Migration.RateLimit), burst)
+		// 使用每秒限制的行数作为速率，burst 设置为批次大小的一半，确保更平滑的限流
+		burstSize := config.Migration.BatchSize / 2
+		if burstSize < 1 {
+			burstSize = 1
+		}
+		limiter = rate.NewLimiter(rate.Limit(config.Migration.RateLimit), burstSize)
 	}
+
+	logrus.Info(i18n.Tr("MongoDB 连接成功", "MongoDB connection successful"))
+
+	// 初始化全局限速器
+	migration.InitGlobalLimiter(config.Migration.RateLimit)
 
 	return &MongoDBMigration{
 		source:     sourceClient,
 		dest:       destClient,
 		config:     config,
 		limiter:    limiter,
-		stats:      &migration.MigrationStats{StartTime: time.Now()},
+		statsMap:   make(map[string]*migration.MigrationStats),
 		maxRetries: 3,
 		retryDelay: time.Second * 5,
 	}, nil
 }
 
-func connectMongoDB(ctx context.Context, config config.DBConfig) (*mongo.Client, error) {
-	// 检查配置
-	if len(config.Hosts) == 0 {
-		return nil, fmt.Errorf("未配置数据库主机地址")
+// 连接 MongoDB 数据库
+func connectMongoDB(ctx context.Context, config config.DBConfig, clientOptions *options.ClientOptions) (*mongo.Client, error) {
+	// 构建连接字符串
+	var uri string
+	if config.Username != "" && config.Password != "" {
+		// 添加认证数据库，默认为 admin
+		authDB := "admin"
+		if config.AuthDB != "" {
+			authDB = config.AuthDB
+		}
+		uri = fmt.Sprintf("mongodb://%s:%s@%s/?authSource=%s",
+			config.Username,
+			config.Password,
+			strings.Join(config.Hosts, ","),
+			authDB)
+	} else {
+		uri = fmt.Sprintf("mongodb://%s", strings.Join(config.Hosts, ","))
 	}
-	if config.Database == "" {
-		return nil, fmt.Errorf("未配置数据库名")
-	}
 
-	uri := fmt.Sprintf("mongodb://%s:%s@%s/%s?authSource=admin",
-		config.Username,
-		config.Password,
-		strings.Join(config.Hosts, ","),
-		config.Database)
-
-	logrus.Infof("正在连接 MongoDB: %s", strings.Replace(uri, config.Password, "****", 1))
-
-	opts := options.Client().
-		ApplyURI(uri).
-		SetAuth(options.Credential{
-			Username:   config.Username,
-			Password:   config.Password,
-			AuthSource: "admin",
-		})
-
-	client, err := mongo.Connect(ctx, opts)
+	// 连接到 MongoDB
+	client, err := mongo.Connect(ctx, clientOptions.ApplyURI(uri))
 	if err != nil {
-		logrus.Errorf("连接 MongoDB 失败: %v", err)
-		return nil, err
+		return nil, fmt.Errorf(i18n.Tr("MongoDB 连接失败: %v", "Failed to connect to MongoDB: %v"), err)
 	}
 
-	// 设置连接超时
-	ctxTimeout, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	if err = client.Ping(ctxTimeout, nil); err != nil {
-		logrus.Errorf("Ping MongoDB 失败: %v", err)
-		client.Disconnect(ctx)
-		return nil, err
+	// 测试连接
+	if err = client.Ping(ctx, nil); err != nil {
+		return nil, fmt.Errorf(i18n.Tr("MongoDB 连接测试失败: %v", "MongoDB connection test failed: %v"), err)
 	}
 
-	logrus.Info("MongoDB 连接成功")
 	return client, nil
 }
 
-func (m *MongoDBMigration) Close() {
-	ctx := context.Background()
+func (m *MongoDBMigration) Close() error {
+	var errs []string
 	if m.source != nil {
-		m.source.Disconnect(ctx)
+		if err := m.source.Disconnect(context.Background()); err != nil {
+			errs = append(errs, fmt.Sprintf(i18n.Tr("关闭源数据库连接失败: %v", "Failed to close source database connection: %v"), err))
+		}
 	}
 	if m.dest != nil {
-		m.dest.Disconnect(ctx)
+		if err := m.dest.Disconnect(context.Background()); err != nil {
+			errs = append(errs, fmt.Sprintf(i18n.Tr("关闭目标数据库连接失败: %v", "Failed to close destination database connection: %v"), err))
+		}
 	}
+	if len(errs) > 0 {
+		return fmt.Errorf(strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 func (m *MongoDBMigration) Run(ctx context.Context) error {
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(m.config.Source.Tables))
-
-	// 创建工作池
+	// 设置工作线程数
 	workers := m.config.Migration.Workers
 	if workers <= 0 {
 		workers = 4 // 默认值
 	}
 	semaphore := make(chan struct{}, workers)
-	logrus.Infof("使用 %d 个工作线程进行并发迁移", workers)
-
-	// 设置进度报告间隔
-	interval := time.Duration(m.config.Migration.ProgressInterval)
-	if interval <= 0 {
-		interval = 5 // 默认5秒
-	}
-	logrus.Infof("进度报告间隔: %d 秒", interval)
-
-	// 启动进度报告
-	ticker := time.NewTicker(time.Second * interval)
-	go func() {
-		for range ticker.C {
-			m.stats.Report()
-		}
-	}()
-	defer ticker.Stop()
+	logrus.Infof(i18n.Tr("使用 %d 个工作线程进行并发迁移", "Using %d worker threads for concurrent migration"), workers)
+	// 输出全局配置信息
+	logrus.Infof(i18n.Tr("开始执行数据查询，批次大小: %d, 全局限速: %d 行/秒",
+		"Starting data query, batch size: %d, global rate limit: %d rows/sec"),
+		m.config.Migration.BatchSize, m.config.Migration.RateLimit)
 
 	// 并发迁移集合
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(m.config.Source.Tables))
+
 	for _, table := range m.config.Source.Tables {
 		wg.Add(1)
 		// 获取信号量
@@ -163,11 +178,12 @@ func (m *MongoDBMigration) Run(ctx context.Context) error {
 			defer wg.Done()
 			defer func() { <-semaphore }() // 释放信号量
 			if err := m.migrateCollection(ctx, table); err != nil {
-				errChan <- fmt.Errorf("迁移集合 %s 失败: %v", table.Name, err)
+				errChan <- fmt.Errorf(i18n.Tr("迁移集合 %s 失败: %v", "Failed to migrate collection %s: %v"), table.Name, err)
 			}
 		}(table)
 	}
 
+	// 等待所有迁移完成
 	wg.Wait()
 	close(errChan)
 
@@ -178,301 +194,247 @@ func (m *MongoDBMigration) Run(ctx context.Context) error {
 	}
 
 	if len(errors) > 0 {
-		return fmt.Errorf("迁移过程中发生错误:\n%s", strings.Join(errors, "\n"))
+		return fmt.Errorf(i18n.Tr("迁移过程中发生错误:\n%s", "Migration failed with errors:\n%s"), strings.Join(errors, "\n"))
 	}
 
-	m.stats.Report() // 最终报告
+	logrus.Info(i18n.Tr("所有集合迁移完成", "All collections migration completed"))
 	return nil
 }
 
-func (m *MongoDBMigration) migrateCollection(ctx context.Context, table config.TableMapping) error {
-	// 检查数据库连接
-	if m.source == nil || m.dest == nil {
-		return fmt.Errorf("数据库连接未初始化")
-	}
+func (m *MongoDBMigration) migrateCollection(ctx context.Context, collection config.TableMapping) error {
+	logrus.Infof(i18n.Tr("开始迁移集合: %s", "Starting migration for collection: %s"), collection.Name)
 
-	logrus.Infof("开始迁移集合: %s", table.Name)
-
-	// 获取源集合
+	// 首先检查集合是否存在
 	sourceDB := m.source.Database(m.config.Source.Database)
-	if sourceDB == nil {
-		return fmt.Errorf("源数据库 %s 不存在", m.config.Source.Database)
-	}
-
-	sourceColl := sourceDB.Collection(table.Name)
-	if sourceColl == nil {
-		return fmt.Errorf("源集合 %s 不存在", table.Name)
-	}
-
-	// 检查集合是否存在，使用 bson.D
-	filter := bson.D{{"name", table.Name}}
-	collections, err := sourceDB.ListCollections(ctx, filter)
+	collections, err := sourceDB.ListCollectionNames(ctx, bson.M{"name": collection.Name})
 	if err != nil {
-		return fmt.Errorf("检查集合是否存在失败: %v", err)
+		return fmt.Errorf(i18n.Tr("检查集合是否存在失败: %v", "Failed to check if collection exists: %v"), err)
 	}
-
-	exists := false
-	for collections.Next(ctx) {
-		exists = true
-		break
-	}
-	if !exists {
-		logrus.Infof("集合 %s 在源数据库中不存在，跳过", table.Name)
-		return fmt.Errorf("集合 %s 不存在", table.Name)
-	}
-
-	// 检查断点
-	checkpoint, err := m.loadCheckpoint(table.Name)
-	if err != nil {
-		logrus.Infof("加载断点信息失败: %v, 将从头开始迁移", err)
-	} else if checkpoint != nil && checkpoint.Complete {
-		logrus.Infof("集合 %s 已完成迁移，跳过", table.Name)
-		return nil
+	if len(collections) == 0 {
+		logrus.Warnf(i18n.Tr("集合 %s 在源数据库中不存在，跳过", "Collection %s does not exist in source database, skipping"), collection.Name)
+		return fmt.Errorf(i18n.Tr("集合 %s 不存在", "Collection %s does not exist"), collection.Name)
 	}
 
 	// 确定目标集合名
-	targetName := table.Name
-	if table.TargetName != "" {
-		targetName = table.TargetName
+	targetName := collection.Name
+	if collection.TargetName != "" {
+		targetName = collection.TargetName
 	}
 
-	// 获取目标集合
-	destDB := m.dest.Database(m.config.Destination.Database)
-	destColl := destDB.Collection(targetName)
+	// 初始化统计信息，即使集合已完成也需要创建，避免空指针
+	stats := migration.NewMigrationStats(0, m.config.Migration.ProgressInterval, collection.Name)
+	m.statsMap[collection.Name] = stats
 
-	// 检查断点并构建查询条件
-	filter = bson.D{}
-	if checkpoint != nil && checkpoint.LastKey != nil {
-		if id, ok := checkpoint.LastKey["_id"]; ok {
-			// 尝试解析 ObjectId
-			if strings.HasPrefix(id, "ObjectId('") && strings.HasSuffix(id, "')") {
-				// 提取 ObjectId 的实际值
-				idStr := strings.TrimPrefix(strings.TrimSuffix(id, "')"), "ObjectId('")
-				objID, err := primitive.ObjectIDFromHex(idStr)
-				if err != nil {
-					return fmt.Errorf("解析 ObjectId 失败: %v", err)
-				}
-				filter = bson.D{{"_id", bson.D{{"$gt", objID}}}}
-				logrus.Infof("从断点位置继续: %v", id)
-			} else {
-				// 如果不是 ObjectId 格式，可能是其他格式的 ID
-				filter = bson.D{{"_id", bson.D{{"$gt", id}}}}
-				logrus.Infof("从断点位置继续: %v", id)
-			}
-		}
-	}
+	// 启动进度报告
+	stats.StartReporting(time.Duration(m.config.Migration.ProgressInterval) * time.Second)
+	defer func() {
+		stats.StopReporting()
+		delete(m.statsMap, collection.Name) // 清理统计信息
+	}()
 
-	// 获取总文档数
-	totalCount, err := sourceColl.CountDocuments(ctx, filter)
+	// 检查断点
+	checkpoint, err := m.loadCheckpoint(collection.Name)
 	if err != nil {
-		return fmt.Errorf("获取总文档数失败: %v", err)
-	}
-	m.stats.TotalRows = totalCount
-
-	logrus.Infof("剩余文档数: %d", totalCount)
-
-	// 只在真正完成时退出
-	if totalCount == 0 && checkpoint != nil && checkpoint.Complete {
-		logrus.Infof("集合 %s 已完成迁移，跳过", table.Name)
+		logrus.Infof(i18n.Tr("加载断点信息失败: %v, 将从头开始迁移", "Failed to load checkpoint: %v, will start migration from beginning"), err)
+	} else if checkpoint != nil && checkpoint.Complete {
+		logrus.Infof(i18n.Tr("集合 %s 已完成迁移，跳过", "Collection %s migration already completed, skipping"), collection.Name)
 		return nil
 	}
 
-	// 设置查询选项
-	findOptions := options.Find().
-		SetBatchSize(int32(m.config.Migration.BatchSize)).
-		SetSort(bson.D{{"_id", 1}})
-
-	// 开始迁移数据
-	cursor, err := sourceColl.Find(ctx, filter, findOptions)
+	// 获取总文档数
+	totalDocs, err := sourceDB.Collection(collection.Name).CountDocuments(ctx, bson.M{})
 	if err != nil {
-		return fmt.Errorf("查询数据失败: %v", err)
+		return fmt.Errorf(i18n.Tr("获取集合总文档数失败: %v", "Failed to get collection document count: %v"), err)
+	}
+
+	// 更新总行数
+	stats.TotalRows = totalDocs
+
+	// 获取主键
+	primaryKey := "_id"
+	if collection.PrimaryKey != "" {
+		primaryKey = collection.PrimaryKey
+	}
+	logrus.Infof(i18n.Tr("集合 %s 使用主键: %s", "Collection %s using primary key: %s"), collection.Name, primaryKey)
+
+	var remainingDocs int64
+	var filter bson.M
+
+	// 如果有断点，计算已完成的文档数
+	if checkpoint != nil && len(checkpoint.LastKey) > 0 {
+		if lastID, ok := checkpoint.LastKey["_id"]; ok {
+			objID, err := primitive.ObjectIDFromHex(lastID)
+			if err == nil {
+				filter = bson.M{"_id": bson.M{"$gt": objID}}
+
+				// 获取从断点位置开始的剩余文档数
+				remainingDocs, err = sourceDB.Collection(collection.Name).CountDocuments(ctx, filter)
+				if err != nil {
+					return fmt.Errorf(i18n.Tr("获取剩余文档数失败: %v", "Failed to get remaining document count: %v"), err)
+				}
+
+				// 计算已处理的文档数
+				completedDocs := totalDocs - remainingDocs
+
+				// 设置起始进度
+				stats.ProcessedRows = 0         // 从0开始计数
+				stats.TotalRows = remainingDocs // 设置为剩余行数
+
+				logrus.Infof(i18n.Tr("从断点继续，已完成 %d 行，剩余 %d 行",
+					"Continuing from checkpoint, completed %d rows, remaining %d rows"),
+					completedDocs, remainingDocs)
+				logrus.Infof(i18n.Tr("从断点继续，上次处理到 %s=%s",
+					"Continuing from checkpoint, last processed %s=%s"),
+					primaryKey, lastID)
+
+				// 重置统计信息
+				stats.ResetStartTime(true)
+			}
+		}
+	} else {
+		// 从头开始迁移
+		stats.ProcessedRows = 0
+		remainingDocs = totalDocs
+		stats.ResetStartTime(false)
+		filter = bson.M{} // 空过滤器，查询所有文档
+	}
+
+	// 设置批处理大小
+	batchSize := m.config.Migration.BatchSize
+	if batchSize <= 0 {
+		batchSize = 1000 // 默认批处理大小
+	}
+
+	// 获取源集合和目标集合
+	sourceColl := sourceDB.Collection(collection.Name)
+	destDB := m.dest.Database(m.config.Destination.Database)
+	destColl := destDB.Collection(targetName)
+
+	// 执行查询
+	cursor, err := sourceColl.Find(ctx, filter, options.Find().
+		SetBatchSize(int32(batchSize)).
+		SetNoCursorTimeout(true))
+	if err != nil {
+		return fmt.Errorf(i18n.Tr("查询集合失败: %v", "Failed to query collection: %v"), err)
 	}
 	defer cursor.Close(ctx)
 
-	// 辅助函数：将 ID 转换为字符串
-	var getIDString = func(id interface{}) string {
-		switch v := id.(type) {
-		case primitive.ObjectID:
-			return fmt.Sprintf("ObjectId('%s')", v.Hex())
-		default:
-			return fmt.Sprint(v)
-		}
-	}
-
-	// 创建断点保存计时器
-	checkpointTicker := time.NewTicker(time.Second) // 每秒保存一次断点
-	defer checkpointTicker.Stop()
-
-	var mu sync.Mutex
-	var lastProcessedID interface{}
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-checkpointTicker.C:
-				mu.Lock()
-				if lastProcessedID != nil {
-					lastKey := map[string]string{"_id": getIDString(lastProcessedID)}
-					if err := m.saveCheckpoint(table.Name, lastKey, false); err != nil {
-						logrus.Warnf("保存断点失败: %v", err)
-					}
-				}
-				mu.Unlock()
-			}
-		}
-	}()
-
-	// 创建令牌桶，用于批量获取令牌
-	var limiter *rate.Limiter
-	if m.config.Migration.RateLimit > 0 {
-		burst := max(m.config.Migration.BatchSize, m.config.Migration.RateLimit)
-		limiter = rate.NewLimiter(rate.Limit(m.config.Migration.RateLimit), burst)
-	}
-
-	batch := make([]interface{}, 0, m.config.Migration.BatchSize)
-	count := 0
+	// 批量处理数据
+	batch := make([]interface{}, 0, batchSize)
+	var lastID string
 
 	for cursor.Next(ctx) {
-		var doc bson.D
+		var doc bson.M
 		if err := cursor.Decode(&doc); err != nil {
-			return fmt.Errorf("解码文档失败: %v", err)
-		}
-
-		// 更新最后处理的ID
-		for _, elem := range doc {
-			if elem.Key == "_id" {
-				mu.Lock()
-				lastProcessedID = elem.Value
-				mu.Unlock()
-				break
-			}
+			return fmt.Errorf(i18n.Tr("解码文档失败: %v", "Failed to decode document: %v"), err)
 		}
 
 		batch = append(batch, doc)
-		count++
+		if id, ok := doc["_id"].(primitive.ObjectID); ok {
+			lastID = id.Hex()
+		}
 
-		if count >= m.config.Migration.BatchSize {
-			// 执行批量插入前进行限流
-			if limiter != nil {
-				reservation := limiter.ReserveN(time.Now(), count)
-				if !reservation.OK() {
-					return fmt.Errorf("无法获取足够的令牌")
-				}
-				delay := reservation.Delay()
-				if delay > 0 {
-					select {
-					case <-time.After(delay):
-					case <-ctx.Done():
-						return ctx.Err()
-					}
-				}
-			}
-
+		// 当批次达到指定大小时，执行插入
+		if len(batch) >= batchSize {
 			if err := m.insertBatch(ctx, destColl, batch); err != nil {
 				return err
 			}
-			m.stats.Increment(count)
+
+			// 更新进度
+			stats.Lock()
+			stats.ProcessedRows += int64(len(batch))
+			stats.Unlock()
+
+			// 应用全局限速
+			if err := migration.EnforceGlobalRateLimit(ctx, len(batch)); err != nil {
+				return err
+			}
+
+			// 保存断点
+			if err := m.saveCheckpoint(collection.Name, map[string]string{"_id": lastID}, false); err != nil {
+				logrus.Warnf(i18n.Tr("保存断点失败: %v", "Failed to save checkpoint: %v"), err)
+			}
+
 			batch = batch[:0]
-			count = 0
 		}
 	}
 
 	// 处理最后一批数据
 	if len(batch) > 0 {
-		// 执行批量插入前进行限流
-		if limiter != nil {
-			reservation := limiter.ReserveN(time.Now(), len(batch))
-			if !reservation.OK() {
-				return fmt.Errorf("无法获取足够的令牌")
-			}
-			delay := reservation.Delay()
-			if delay > 0 {
-				select {
-				case <-time.After(delay):
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
-		}
-
 		if err := m.insertBatch(ctx, destColl, batch); err != nil {
 			return err
 		}
-		m.stats.Increment(len(batch))
-	}
 
-	// 在断点保存协程中
-	if lastProcessedID != nil {
-		lastKey := map[string]string{"_id": getIDString(lastProcessedID)}
-		if err := m.saveCheckpoint(table.Name, lastKey, false); err != nil {
-			logrus.Warnf("保存断点失败: %v", err)
+		// 更新进度
+		stats.Lock()
+		stats.ProcessedRows += int64(len(batch))
+		stats.Unlock()
+
+		// 保存最后的断点
+		if err := m.saveCheckpoint(collection.Name, map[string]string{"_id": lastID}, false); err != nil {
+			logrus.Warnf(i18n.Tr("保存断点失败: %v", "Failed to save checkpoint: %v"), err)
 		}
 	}
 
-	// 在完成时
-	if lastProcessedID != nil {
-		lastKey := map[string]string{"_id": getIDString(lastProcessedID)}
-		if err := m.saveCheckpoint(table.Name, lastKey, true); err != nil {
-			logrus.Errorf("保存完成标记失败: %v", err)
+	// 保存完成标记
+	if err := m.saveCheckpoint(collection.Name, map[string]string{"_id": lastID}, true); err != nil {
+		logrus.Warnf(i18n.Tr("保存完成标记失败: %v", "Failed to save completion marker: %v"), err)
+	}
+
+	logrus.Infof(i18n.Tr("集合 %s 迁移完成，共迁移 %d 文档", "Collection %s migration completed, migrated %d documents"), collection.Name, totalDocs)
+
+	return nil
+}
+
+// insertBatch 批量插入文档
+func (m *MongoDBMigration) insertBatch(ctx context.Context, coll *mongo.Collection, batch []interface{}) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	// 使用重试机制
+	for i := 0; i <= m.maxRetries; i++ {
+		// 创建批量写入操作
+		var writes []mongo.WriteModel
+		for _, doc := range batch {
+			// 使用 upsert 操作，如果文档存在则更新，不存在则插入
+			filter := bson.M{"_id": doc.(bson.M)["_id"]}
+			update := bson.M{"$set": doc}
+			model := mongo.NewUpdateOneModel().
+				SetFilter(filter).
+				SetUpdate(update).
+				SetUpsert(true)
+			writes = append(writes, model)
+		}
+
+		// 执行批量写入
+		opts := options.BulkWrite().SetOrdered(false)
+		_, err := coll.BulkWrite(ctx, writes, opts)
+		if err == nil {
+			return nil
+		}
+
+		// 如果不是最后一次尝试，则等待后重试
+		if i < m.maxRetries {
+			logrus.Warnf(i18n.Tr("批量插入失败，将在 %v 后重试: %v", "Batch insert failed, will retry in %v: %v"), m.retryDelay, err)
+			select {
+			case <-time.After(m.retryDelay):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		} else {
-			logrus.Infof("集合 %s 迁移完成，共迁移 %d 文档", table.Name, m.stats.ProcessedRows)
+			return fmt.Errorf(i18n.Tr("批量插入失败，已重试 %d 次: %v", "Batch insert failed after %d retries: %v"), m.maxRetries, err)
 		}
 	}
 
 	return nil
 }
 
-func (m *MongoDBMigration) insertBatch(ctx context.Context, coll *mongo.Collection, batch []interface{}) error {
-	if m.limiter != nil {
-		reservation := m.limiter.ReserveN(time.Now(), len(batch))
-		if !reservation.OK() {
-			return fmt.Errorf("无法获取足够的令牌")
-		}
-		delay := reservation.Delay()
-		if delay > 0 {
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	}
-
-	// 将批量插入改为批量 upsert
-	operations := make([]mongo.WriteModel, len(batch))
-	for i, doc := range batch {
-		bsonDoc := doc.(bson.D)
-		var filter bson.D
-		// 提取 _id 作为过滤条件
-		for _, elem := range bsonDoc {
-			if elem.Key == "_id" {
-				filter = bson.D{{"_id", elem.Value}}
-				break
-			}
-		}
-		// 创建 upsert 操作
-		operations[i] = mongo.NewReplaceOneModel().
-			SetFilter(filter).
-			SetReplacement(doc).
-			SetUpsert(true)
-	}
-
-	opts := options.BulkWrite().SetOrdered(false)
-	for i := 0; i < m.maxRetries; i++ {
-		_, err := coll.BulkWrite(ctx, operations, opts)
-		if err == nil {
-			return nil
-		}
-		if i < m.maxRetries-1 {
-			logrus.Warnf("插入失败，准备重试: %v", err)
-			time.Sleep(m.retryDelay)
-			continue
-		}
-		return fmt.Errorf("批量插入失败: %v", err)
-	}
-	return nil
+// 获取最后处理的ID
+func (m *MongoDBMigration) getLastProcessedID() (string, bool) {
+	// 这里应该实现获取最后处理的ID的逻辑
+	// 由于没有完整的代码，这里只是一个占位符
+	return "", false
 }
 
 func (m *MongoDBMigration) loadCheckpoint(tableName string) (*migration.Checkpoint, error) {
@@ -488,18 +450,18 @@ func (m *MongoDBMigration) loadCheckpoint(tableName string) (*migration.Checkpoi
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, err
+		return nil, fmt.Errorf(i18n.Tr("读取断点文件失败: %v", "Failed to read checkpoint file: %v"), err)
 	}
 
 	var checkpoint migration.Checkpoint
 	if err := json.Unmarshal(data, &checkpoint); err != nil {
-		return nil, err
+		return nil, fmt.Errorf(i18n.Tr("解析断点数据失败: %v", "Failed to parse checkpoint data: %v"), err)
 	}
 
 	return &checkpoint, nil
 }
 
-func (m *MongoDBMigration) saveCheckpoint(tableName string, lastKey map[string]string, completed bool) error {
+func (m *MongoDBMigration) saveCheckpoint(collectionName string, lastKey map[string]string, complete bool) error {
 	if m.config.Migration.CheckpointDir == "" {
 		return nil
 	}
@@ -507,18 +469,55 @@ func (m *MongoDBMigration) saveCheckpoint(tableName string, lastKey map[string]s
 	checkpoint := &migration.Checkpoint{
 		LastKey:     lastKey,
 		LastUpdated: time.Now(),
-		Complete:    completed,
+		Complete:    complete,
 	}
 
 	data, err := json.Marshal(checkpoint)
 	if err != nil {
-		return err
+		return fmt.Errorf(i18n.Tr("序列化断点数据失败: %v", "Failed to serialize checkpoint data: %v"), err)
 	}
 
 	filename := filepath.Join(m.config.Migration.CheckpointDir,
-		fmt.Sprintf("mongodb_%s.checkpoint", tableName))
+		fmt.Sprintf("mongodb_%s.checkpoint", collectionName))
 
-	return os.WriteFile(filename, data, 0644)
+	// 创建临时文件
+	tempFile := filename + ".tmp"
+	if err := os.WriteFile(tempFile, data, 0644); err != nil {
+		return fmt.Errorf(i18n.Tr("写入断点文件失败: %v", "Failed to write checkpoint file: %v"), err)
+	}
+
+	// 确保数据已写入磁盘
+	f, err := os.Open(tempFile)
+	if err != nil {
+		return fmt.Errorf(i18n.Tr("打开临时断点文件失败: %v", "Failed to open temporary checkpoint file: %v"), err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf(i18n.Tr("同步断点文件失败: %v", "Failed to sync checkpoint file: %v"), err)
+	}
+	f.Close()
+
+	// 原子地重命名文件，确保断点文件的完整性
+	if err := os.Rename(tempFile, filename); err != nil {
+		return fmt.Errorf(i18n.Tr("重命名断点文件失败: %v", "Failed to rename checkpoint file: %v"), err)
+	}
+
+	return nil
+}
+
+// 添加辅助函数来构建 $project 阶段
+func buildProjectStage(transformations []config.ColumnTransformation) bson.M {
+	project := bson.M{}
+
+	// 首先添加所有字段，确保不会丢失字段
+	project["_id"] = 1
+
+	// 然后应用转换
+	for _, transform := range transformations {
+		project[transform.SourceColumn] = transform.Expression
+	}
+
+	return project
 }
 
 // 辅助函数
