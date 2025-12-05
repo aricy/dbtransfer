@@ -22,6 +22,7 @@ type TableMapping struct {
 	Name                  string                 `yaml:"name"`
 	TargetName            string                 `yaml:"target_name,omitempty"`
 	PrimaryKey            string                 `yaml:"primary_key,omitempty"`
+	Where                 string                 `yaml:"where,omitempty"` // 自定义 WHERE 条件，完全替换主键条件
 	ColumnTransformations []ColumnTransformation `yaml:"column_transformations,omitempty"`
 }
 

@@ -1,0 +1,35 @@
+source:
+  type: mysql
+  hosts:
+    - "localhost:3306"
+  database: "test_source"
+  username: "root"
+  password: "password"
+  tables:
+    # 测试简单 WHERE 条件
+    - name: "sbtest1"
+      target_name: "sbtest1_new"
+      where: "k = 99734"
+
+    # 测试带排序的 WHERE 条件
+    - name: "sbtest2"
+      target_name: "sbtest2_new"
+      where: "k > 1000 ORDER BY k"
+
+destination:
+  type: mysql
+  hosts:
+    - "localhost:3306"
+  database: "test_dest"
+  username: "root"
+  password: "password"
+
+migration:
+  workers: 4
+  batch_size: 30
+  rate_limit: 30000
+  timeout: 30
+  checkpoint_dir: "./data/checkpoints"
+  log_file: "./logs/migration.log"
+  log_level: "debug"
+  progress_interval: 5 

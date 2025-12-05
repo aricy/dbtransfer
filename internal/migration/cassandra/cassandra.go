@@ -362,7 +362,7 @@ func (m *CassandraMigration) migrateDependencies() error {
 			continue
 		}
 
-		createType := fmt.Sprintf("CREATE TYPE IF NOT EXISTS %s.%s (%s)",
+		createType := fmt.Sprintf("CREATE TYPE IF NOT EXISTS %s.\"%s\" (%s)",
 			m.config.Destination.Keyspace,
 			typeName,
 			buildTypeFields(fieldNames, fieldTypes))
@@ -412,7 +412,7 @@ func (m *CassandraMigration) migrateDependencies() error {
 			nullInput = "CALLED ON NULL INPUT"
 		}
 
-		createFunc := fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.%s (%s)
+		createFunc := fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s."%s" (%s)
 			RETURNS %s
 			LANGUAGE %s
 			%s
@@ -445,9 +445,45 @@ func (m *CassandraMigration) migrateDependencies() error {
 func buildTypeFields(names, types []string) string {
 	fields := make([]string, len(names))
 	for i := range names {
-		fields[i] = fmt.Sprintf("%s %s", names[i], types[i])
+		fields[i] = fmt.Sprintf("\"%s\" %s", names[i], types[i])
 	}
 	return strings.Join(fields, ", ")
+}
+
+type BatchJob struct {
+	Batch   *gocql.Batch
+	LastKey map[string]string
+	Index   int
+	Count   int
+}
+
+type BatchResult struct {
+	Index   int
+	LastKey map[string]string
+	Count   int
+	Error   error
+}
+
+func (m *CassandraMigration) worker(ctx context.Context, jobs <-chan BatchJob, results chan<- BatchResult) {
+	for job := range jobs {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		err := m.executeBatchWithRetry(job.Batch)
+		select {
+		case results <- BatchResult{
+			Index:   job.Index,
+			LastKey: job.LastKey,
+			Count:   job.Count,
+			Error:   err,
+		}:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetName string, checkpoint *migration.Checkpoint) error {
@@ -566,10 +602,10 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 		if !transformed {
 			if pkMap[col.Name] || isCollection {
 				// 主键列和集合类型不需要 TTL
-				queryParts = append(queryParts, col.Name)
+				queryParts = append(queryParts, fmt.Sprintf("\"%s\"", col.Name))
 			} else {
 				// 非主键且非集合类型的列添加 TTL
-				queryParts = append(queryParts, fmt.Sprintf("%s, TTL(%s)", col.Name, col.Name))
+				queryParts = append(queryParts, fmt.Sprintf("\"%s\", TTL(\"%s\")", col.Name, col.Name))
 			}
 		}
 	}
@@ -655,7 +691,7 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 			strings.Contains(colType, "map<") ||
 			strings.Contains(colType, "set<")
 
-		insertParts[i] = col.Name
+		insertParts[i] = fmt.Sprintf("\"%s\"", col.Name)
 		placeholders[i] = "?"
 
 		// 只计算非主键且非集合类型的列
@@ -670,90 +706,151 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 		strings.Join(insertParts, ", "),
 		strings.Join(placeholders, ", "))
 
-	// 创建数据值数组
-	var dataValues []interface{}
-
 	// 只有在有非主键列时才添加 TTL 子句
 	if ttlCount > 0 {
 		insertQuery += " USING TTL ?"
-		// 提取数据值时也要相应修改
-		dataValues = make([]interface{}, len(columns)+1) // +1 是为了TTL值
-		for i := range columns {
-			colType := columnTypes[columns[i].Name]
-			isCollection := strings.Contains(colType, "list<") ||
-				strings.Contains(colType, "map<") ||
-				strings.Contains(colType, "set<")
-
-			if !pkMap[columns[i].Name] && !isCollection {
-				dataValues[i] = *(ttlValues[i].(*int))
-			}
-		}
-		dataValues[len(dataValues)-1] = dataValues[0] // 将TTL值设置为第一个非集合且非主键列的TTL
-	} else {
-		dataValues = make([]interface{}, len(columns)) // 没有TTL值
 	}
 
 	logrus.Debugf(i18n.Tr("插入语句: %s", "Insert query: %s"), insertQuery)
 	logrus.Debugf(i18n.Tr("列数: %d, 主键列数: %d, TTL列数: %d", "Column count: %d, primary key column count: %d, TTL column count: %d"), len(columns), len(columns)-ttlCount, ttlCount)
 
-	// 处理数据
-	batch := m.dest.NewBatch(gocql.UnloggedBatch)
-	count := 0
-	rowCount := 0
+	// 初始化并发控制
+	numWorkers := 16
+	jobs := make(chan BatchJob, numWorkers*2)
+	results := make(chan BatchResult, numWorkers*2)
+	var wg sync.WaitGroup
 
-	// 创建断点保存计时器
-	checkpointTicker := time.NewTicker(time.Second) // 每秒保存一次断点
-	defer checkpointTicker.Stop()
+	// 启动工作协程
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.worker(ctx, jobs, results)
+		}()
+	}
 
-	// 创建一个变量来存储最后处理的位置
-	var lastProcessedKey map[string]string
+	// 启动提交协程
+	commitDone := make(chan error, 1)
+	var finalKey map[string]string
 
 	go func() {
-		for range checkpointTicker.C {
-			if stats, ok := m.statsMap[sourceName]; ok {
-				stats.Lock()
-				if lastProcessedKey != nil {
-					if err := m.saveCheckpoint(sourceName, lastProcessedKey, false); err != nil {
-						logrus.Warnf(i18n.Tr("保存断点失败: %v", "Failed to save checkpoint: %v"), err)
+		defer close(commitDone)
+		var lastProcessedKey map[string]string
+		nextIndex := 0
+		buffer := make(map[int]BatchResult)
+
+		checkpointTicker := time.NewTicker(time.Second)
+		defer checkpointTicker.Stop()
+
+		for {
+			select {
+			case result, ok := <-results:
+				if !ok {
+					// 所有结果已处理
+					finalKey = lastProcessedKey
+					return
+				}
+
+				if result.Error != nil {
+					commitDone <- result.Error
+					return
+				}
+
+				buffer[result.Index] = result
+
+				// 处理连续的结果
+				for {
+					if res, exists := buffer[nextIndex]; exists {
+						m.statsMap[sourceName].Increment(res.Count)
+						lastProcessedKey = res.LastKey
+						delete(buffer, nextIndex)
+						nextIndex++
+					} else {
+						break
 					}
 				}
-				stats.Unlock()
+
+			case <-checkpointTicker.C:
+				// 保存断点
+				if stats, ok := m.statsMap[sourceName]; ok {
+					stats.Lock()
+					if lastProcessedKey != nil {
+						if err := m.saveCheckpoint(sourceName, lastProcessedKey, false); err != nil {
+							logrus.Warnf(i18n.Tr("保存断点失败: %v", "Failed to save checkpoint: %v"), err)
+						}
+					}
+					stats.Unlock()
+				}
+
+			case <-ctx.Done():
+				commitDone <- ctx.Err()
+				return
 			}
 		}
 	}()
 
 	// 处理数据
+	batch := m.dest.NewBatch(gocql.UnloggedBatch)
+	count := 0
+	batchIndex := 0
+	var currentKey map[string]string
+
 	for dataIter.Scan(valuePointers...) {
-		rowCount++
 		if err := m.limiter.Wait(ctx); err != nil {
 			return err
 		}
 
 		// 提取数据值
-		dataValues := make([]interface{}, len(columns))
+		var dataValues []interface{}
+		if ttlCount > 0 {
+			dataValues = make([]interface{}, len(columns)+1)
+		} else {
+			dataValues = make([]interface{}, len(columns))
+		}
+
 		valueIndex := 0
 
 		// 复制列值
 		for i := range columns {
 			switch v := values[i].(type) {
 			case *[]map[string]interface{}:
-				// 对于 list<frozen<...>> 类型
 				if v != nil {
-					dataValues[valueIndex] = *v // 直接使用解引用的值
+					// Deep copy for list<frozen<...>>
+					src := *v
+					dst := make([]map[string]interface{}, len(src))
+					for j, m := range src {
+						dst[j] = make(map[string]interface{}, len(m))
+						for k, val := range m {
+							dst[j][k] = val
+						}
+					}
+					dataValues[valueIndex] = dst
 				}
 			case *map[string]interface{}:
-				// 对于 frozen<...> 类型
 				if v != nil {
-					dataValues[valueIndex] = *v // 直接使用解引用的值
+					// Deep copy for frozen<...> or map<...>
+					src := *v
+					dst := make(map[string]interface{}, len(src))
+					for k, val := range src {
+						dst[k] = val
+					}
+					dataValues[valueIndex] = dst
 				}
 			case *[]interface{}:
-				// 对于 list<...> 类型
 				if v != nil {
-					dataValues[valueIndex] = *v // 直接使用解引用的值
+					// Deep copy for list<...> or set<...>
+					src := *v
+					dst := make([]interface{}, len(src))
+					copy(dst, src)
+					dataValues[valueIndex] = dst
 				}
 			case *[]byte:
 				if v != nil {
-					dataValues[valueIndex] = *v // 对于blob类型，直接使用解引用的值
+					// Deep copy for blob
+					src := *v
+					dst := make([]byte, len(src))
+					copy(dst, src)
+					dataValues[valueIndex] = dst
 				}
 			case *int64:
 				if v != nil {
@@ -773,7 +870,6 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 				}
 			default:
 				if v != nil {
-					// 对于其他类型，使用反射获取实际值
 					dataValues[valueIndex] = reflect.ValueOf(v).Elem().Interface()
 				}
 			}
@@ -782,7 +878,6 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 
 		// 如果需要TTL，添加TTL值
 		if ttlCount > 0 {
-			// 找到第一个非集合且非主键列的TTL值
 			for i := range columns {
 				colType := columnTypes[columns[i].Name]
 				isCollection := strings.Contains(colType, "list<") ||
@@ -791,14 +886,14 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 
 				if !pkMap[columns[i].Name] && !isCollection && ttlValues[i] != nil {
 					ttlVal := *(ttlValues[i].(*int))
-					dataValues = append(dataValues, ttlVal)
+					dataValues[len(dataValues)-1] = ttlVal
 					break
 				}
 			}
 		}
 
-		// 更新最后处理的位置
-		currentKey := make(map[string]string)
+		// 更新当前键
+		currentKey = make(map[string]string)
 		for i, col := range columns {
 			if partitionKeys[col.Name] {
 				switch v := values[i].(type) {
@@ -825,30 +920,42 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 				}
 			}
 		}
-		m.statsMap[sourceName].Lock()
-		lastProcessedKey = currentKey
-		m.statsMap[sourceName].Unlock()
 
 		// 添加到批处理
 		batch.Query(insertQuery, dataValues...)
 		count++
 
 		if count >= m.config.Migration.BatchSize {
-			if err := m.executeBatchWithRetry(batch); err != nil {
-				return err
+			jobs <- BatchJob{
+				Batch:   batch,
+				LastKey: currentKey,
+				Index:   batchIndex,
+				Count:   count,
 			}
 			batch = m.dest.NewBatch(gocql.UnloggedBatch)
-			m.statsMap[sourceName].Increment(count)
 			count = 0
+			batchIndex++
 		}
 	}
 
 	// 处理最后一批数据
 	if count > 0 {
-		if err := m.executeBatchWithRetry(batch); err != nil {
-			return err
+		jobs <- BatchJob{
+			Batch:   batch,
+			LastKey: currentKey,
+			Index:   batchIndex,
+			Count:   count,
 		}
-		m.statsMap[sourceName].Increment(count)
+	}
+
+	// 关闭任务通道，等待工作协程完成
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	// 等待提交协程完成
+	if err := <-commitDone; err != nil {
+		return err
 	}
 
 	// 如果迭代器没有错误，说明已经处理完所有数据，标记为完成
@@ -858,19 +965,14 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 
 	// 更新最终进度
 	if stats, ok := m.statsMap[sourceName]; ok {
-		stats.Lock()
-		stats.ProcessedRows += int64(count)
-		stats.Unlock()
-		// 停止进度报告
 		stats.StopReporting()
-		// 最终报告
 		stats.Report()
 	}
 
 	// 标记为完成
 	logrus.Infof(i18n.Tr("表 %s 迁移完成，标记为完成状态", "Table %s migration completed, marking as completed state"), sourceName)
 	completionKey := make(map[string]string)
-	for k, v := range lastProcessedKey {
+	for k, v := range finalKey {
 		completionKey[k] = v
 	}
 
@@ -916,13 +1018,13 @@ func (m *CassandraMigration) getTableSchema(tableName string) (string, error) {
 
 	// 一次性获取所有列信息，包括主键信息
 	for iter.Scan(&columnName, &columnType, &kind, &position) {
-		columns = append(columns, fmt.Sprintf("%s %s", columnName, columnType))
+		columns = append(columns, fmt.Sprintf("\"%s\" %s", columnName, columnType))
 
 		switch kind {
 		case "partition_key":
-			pkColumns = append(pkColumns, columnName)
+			pkColumns = append(pkColumns, fmt.Sprintf("\"%s\"", columnName))
 		case "clustering":
-			clusteringColumns = append(clusteringColumns, columnName)
+			clusteringColumns = append(clusteringColumns, fmt.Sprintf("\"%s\"", columnName))
 		}
 	}
 
@@ -1115,7 +1217,7 @@ func (m *CassandraMigration) buildWhereClause(columnTypes map[string]string, tab
 	lastTokenArgs := make([]string, len(partitionKeys))
 
 	for i, key := range partitionKeys {
-		tokenArgs[i] = key
+		tokenArgs[i] = fmt.Sprintf("\"%s\"", key)
 		if lastVal, ok := checkpoint.LastKey[key]; ok {
 			switch columnTypes[key] {
 			case "text", "varchar", "ascii":
