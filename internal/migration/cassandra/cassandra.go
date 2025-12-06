@@ -565,6 +565,24 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 		return fmt.Errorf(i18n.Tr("表 %s 没有主键", "Table %s has no primary key"), sourceName)
 	}
 
+	// 检查是否有列转换和 TTL 配置
+	var tableConfig config.TableMapping
+	for _, t := range m.config.Source.Tables {
+		if t.Name == sourceName {
+			tableConfig = t
+			break
+		}
+	}
+
+	// 确定 TTL 模式
+	ttlMode := tableConfig.TTL.Mode
+	if ttlMode == "" {
+		ttlMode = "source" // 默认模式
+	}
+	ttlValue := tableConfig.TTL.Value
+
+	logrus.Infof(i18n.Tr("表 %s TTL 模式: %s, 值: %d", "Table %s TTL mode: %s, value: %d"), sourceName, ttlMode, ttlValue)
+
 	// 构建查询，包括列转换
 	queryParts := make([]string, 0, len(columns))
 	for _, col := range columns {
@@ -575,20 +593,12 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 
 		// 检查是否有列转换
 		transformed := false
-		// 从源表配置中获取列转换信息
-		var tableConfig config.TableMapping
-		for _, t := range m.config.Source.Tables {
-			if t.Name == sourceName {
-				tableConfig = t
-				break
-			}
-		}
 
 		for _, transform := range tableConfig.ColumnTransformations {
 			if transform.SourceColumn == col.Name {
 				// 使用转换表达式，但保持原始列名
-				if pkMap[col.Name] || isCollection {
-					// 主键列和集合类型不需要 TTL
+				if pkMap[col.Name] || isCollection || ttlMode == "target" {
+					// 主键列、集合类型或目标模式不需要 TTL
 					queryParts = append(queryParts, fmt.Sprintf("%s AS %s",
 						transform.Expression, col.Name))
 				} else {
@@ -602,8 +612,8 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 		}
 
 		if !transformed {
-			if pkMap[col.Name] || isCollection {
-				// 主键列和集合类型不需要 TTL
+			if pkMap[col.Name] || isCollection || ttlMode == "target" {
+				// 主键列、集合类型或目标模式不需要 TTL
 				queryParts = append(queryParts, fmt.Sprintf("\"%s\"", col.Name))
 			} else {
 				// 非主键且非集合类型的列添加 TTL
@@ -649,7 +659,7 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 			strings.Contains(colType, "map<") ||
 			strings.Contains(colType, "set<")
 
-		if !pkMap[col.Name] && !isCollection {
+		if !pkMap[col.Name] && !isCollection && ttlMode != "target" {
 			ttlValues[i] = new(int)
 			valuePointers = append(valuePointers, ttlValues[i])
 		}
@@ -678,7 +688,7 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 		placeholders[i] = "?"
 
 		// 只计算非主键且非集合类型的列
-		if !pkMap[col.Name] && !isCollection {
+		if !pkMap[col.Name] && !isCollection && ttlMode != "target" {
 			ttlCount++
 		}
 	}
@@ -827,6 +837,13 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 
 				if !pkMap[columns[i].Name] && !isCollection && ttlValues[i] != nil {
 					ttlVal := *(ttlValues[i].(*int))
+					// Apply TTL modification if needed
+					if ttlMode == "modify" {
+						ttlVal += ttlValue
+						if ttlVal < 0 {
+							ttlVal = 0 // Ensure TTL is not negative
+						}
+					}
 					dataValues[len(dataValues)-1] = ttlVal
 					break
 				}

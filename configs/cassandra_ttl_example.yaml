@@ -1,0 +1,43 @@
+source:
+  type: cassandra
+  hosts:
+    - "localhost:9042"
+  keyspace: "source_ks"
+  username: "cassandra"
+  password: "password"
+  tables:
+    # 示例 1: 默认模式 (source)，保持原表 TTL
+    - name: "table_default"
+      ttl:
+        mode: "source"
+
+    # 示例 2: 修改模式 (modify)，在原表 TTL 基础上增加 3600 秒 (1小时)
+    - name: "table_modify_add"
+      ttl:
+        mode: "modify"
+        value: 3600
+
+    # 示例 3: 修改模式 (modify)，在原表 TTL 基础上减少 60 秒
+    # 注意: 如果计算结果小于 0，TTL 将被设置为 0 (永久保存)
+    - name: "table_modify_sub"
+      ttl:
+        mode: "modify"
+        value: -60
+
+    # 示例 4: 目标模式 (target)，忽略原表 TTL，使用目标表的默认 TTL 设置
+    - name: "table_target"
+      ttl:
+        mode: "target"
+
+destination:
+  type: cassandra
+  hosts:
+    - "localhost:9042"
+  keyspace: "dest_ks"
+  username: "cassandra"
+  password: "password"
+
+migration:
+  batch_size: 1000
+  workers: 16
+  rate_limit: 10000

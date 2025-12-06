@@ -24,6 +24,12 @@ type TableMapping struct {
 	PrimaryKey            string                 `yaml:"primary_key,omitempty"`
 	Where                 string                 `yaml:"where,omitempty"` // 自定义 WHERE 条件，完全替换主键条件
 	ColumnTransformations []ColumnTransformation `yaml:"column_transformations,omitempty"`
+	TTL                   TTLConfig              `yaml:"ttl,omitempty"`
+}
+
+type TTLConfig struct {
+	Mode  string `yaml:"mode"`  // "source" (default), "modify", "target"
+	Value int    `yaml:"value"` // Used for "modify" mode (positive for add, negative for subtract)
 }
 
 type ColumnTransformation struct {
