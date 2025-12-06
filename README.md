@@ -77,6 +77,9 @@ source:
           expression: "price * 100"  # 转换价格单位
         - source_column: status
           expression: "UPPER(status)"  # 将状态转为大写
+      ttl:
+        mode: "modify"
+        value: 3600
 
 destination:
   type: cassandra  # ScyllaDB 使用相同的类型

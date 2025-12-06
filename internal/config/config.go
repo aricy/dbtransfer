@@ -24,7 +24,7 @@ type TableMapping struct {
 	PrimaryKey            string                 `yaml:"primary_key,omitempty"`
 	Where                 string                 `yaml:"where,omitempty"` // 自定义 WHERE 条件，完全替换主键条件
 	ColumnTransformations []ColumnTransformation `yaml:"column_transformations,omitempty"`
-	TTL                   TTLConfig              `yaml:"ttl,omitempty"`
+	TTL                   TTLConfig              `yaml:"ttl,omitempty"` // ScyllaDB/Cassandra TTL 配置
 }
 
 type TTLConfig struct {
