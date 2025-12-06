@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,6 +17,7 @@ import (
 	"github.com/gocql/gocql"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
+	"gopkg.in/inf.v0"
 	"gopkg.in/yaml.v2"
 
 	"dbtransfer/internal/config"
@@ -635,28 +637,9 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 	// 根据列类型创建正确的接收器
 	for i, col := range columns {
 		colType := columnTypes[col.Name]
-		switch {
-		case strings.Contains(colType, "list<frozen<"):
-			values[i] = &[]map[string]interface{}{}
-		case strings.Contains(colType, "frozen<"):
-			values[i] = &map[string]interface{}{}
-		case strings.Contains(colType, "list<"):
-			values[i] = &[]interface{}{}
-		case strings.Contains(colType, "map<"):
-			values[i] = &map[string]interface{}{}
-		case strings.Contains(colType, "set<"):
-			values[i] = &[]interface{}{}
-		case colType == "blob":
-			values[i] = &[]byte{}
-		case strings.Contains(colType, "bigint"):
-			values[i] = new(int64)
-		case strings.Contains(colType, "int"):
-			values[i] = new(int)
-		case strings.Contains(colType, "boolean"):
-			values[i] = new(bool)
-		default:
-			values[i] = new(string)
-		}
+		goType := m.getGoType(colType)
+		// Create **T (pointer to pointer) to handle nullable values
+		values[i] = reflect.New(reflect.PtrTo(goType)).Interface()
 
 		// 添加列值指针
 		valuePointers = append(valuePointers, values[i])
@@ -812,66 +795,24 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 
 		// 复制列值
 		for i := range columns {
-			switch v := values[i].(type) {
-			case *[]map[string]interface{}:
-				if v != nil {
-					// Deep copy for list<frozen<...>>
-					src := *v
-					dst := make([]map[string]interface{}, len(src))
-					for j, m := range src {
-						dst[j] = make(map[string]interface{}, len(m))
-						for k, val := range m {
-							dst[j][k] = val
-						}
-					}
-					dataValues[valueIndex] = dst
-				}
-			case *map[string]interface{}:
-				if v != nil {
-					// Deep copy for frozen<...> or map<...>
-					src := *v
-					dst := make(map[string]interface{}, len(src))
-					for k, val := range src {
-						dst[k] = val
-					}
-					dataValues[valueIndex] = dst
-				}
-			case *[]interface{}:
-				if v != nil {
-					// Deep copy for list<...> or set<...>
-					src := *v
-					dst := make([]interface{}, len(src))
-					copy(dst, src)
-					dataValues[valueIndex] = dst
-				}
-			case *[]byte:
-				if v != nil {
-					// Deep copy for blob
-					src := *v
-					dst := make([]byte, len(src))
-					copy(dst, src)
-					dataValues[valueIndex] = dst
-				}
-			case *int64:
-				if v != nil {
-					dataValues[valueIndex] = *v
-				}
-			case *int:
-				if v != nil {
-					dataValues[valueIndex] = *v
-				}
-			case *bool:
-				if v != nil {
-					dataValues[valueIndex] = *v
-				}
-			case *string:
-				if v != nil {
-					dataValues[valueIndex] = *v
-				}
-			default:
-				if v != nil {
-					dataValues[valueIndex] = reflect.ValueOf(v).Elem().Interface()
-				}
+			// values[i] is **T
+			valPtr := reflect.ValueOf(values[i]).Elem() // *T
+			if !valPtr.IsNil() {
+				// *T is not nil, so we have a value. Extract T (or *T if it's a pointer type like *big.Int)
+				// Wait, if T is inf.Dec, *T is *inf.Dec. valPtr.Interface() is *inf.Dec.
+				// If T is int, *T is *int. valPtr.Interface() is *int.
+				// If T is []int, *T is *[]int. valPtr.Interface() is *[]int.
+
+				// We want to pass the value to the insert query.
+				// For basic types (int, string), we pass the value (int, string).
+				// For structs (inf.Dec, UUID), we pass the value or pointer? gocql Marshal handles both usually.
+				// But for collections, we pass slice/map.
+
+				// Let's use valPtr.Elem().Interface() which returns T.
+				// Except for big.Int which is a struct but usually passed as pointer?
+				// gocql marshals big.Int (value) or *big.Int.
+
+				dataValues[valueIndex] = valPtr.Elem().Interface()
 			}
 			valueIndex++
 		}
@@ -896,26 +837,28 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 		currentKey = make(map[string]string)
 		for i, col := range columns {
 			if partitionKeys[col.Name] {
-				switch v := values[i].(type) {
-				case *string:
-					if v != nil {
-						currentKey[col.Name] = *v
-					}
-				case *[]byte:
-					if v != nil {
-						currentKey[col.Name] = fmt.Sprintf("%x", *v)
-					}
-				case *int:
-					if v != nil {
-						currentKey[col.Name] = fmt.Sprintf("%d", *v)
-					}
-				case *int64:
-					if v != nil {
-						currentKey[col.Name] = fmt.Sprintf("%d", *v)
-					}
-				default:
-					if v != nil {
-						currentKey[col.Name] = fmt.Sprintf("%v", reflect.ValueOf(v).Elem().Interface())
+				valPtr := reflect.ValueOf(values[i]).Elem()
+				if !valPtr.IsNil() {
+					val := valPtr.Elem().Interface()
+					switch v := val.(type) {
+					case string:
+						currentKey[col.Name] = v
+					case []byte:
+						currentKey[col.Name] = fmt.Sprintf("%x", v)
+					case int, int8, int16, int32, int64:
+						currentKey[col.Name] = fmt.Sprintf("%d", v)
+					case gocql.UUID:
+						currentKey[col.Name] = v.String()
+					case float32, float64:
+						currentKey[col.Name] = fmt.Sprintf("%g", v)
+					case inf.Dec:
+						currentKey[col.Name] = v.String()
+					case time.Time:
+						currentKey[col.Name] = fmt.Sprintf("%d", v.UnixMilli())
+					case big.Int:
+						currentKey[col.Name] = v.String()
+					default:
+						currentKey[col.Name] = fmt.Sprintf("%v", v)
 					}
 				}
 			}
@@ -1365,4 +1308,91 @@ func isBasicType(typeName string) bool {
 	}
 
 	return basicTypes[typeName]
+}
+
+func (m *CassandraMigration) getGoType(colType string) reflect.Type {
+	colType = strings.TrimSpace(colType)
+
+	// Handle frozen
+	if strings.HasPrefix(colType, "frozen<") {
+		return m.getGoType(colType[7 : len(colType)-1])
+	}
+
+	// Handle collections
+	if strings.HasPrefix(colType, "list<") {
+		inner := colType[5 : len(colType)-1]
+		elemType := m.getGoType(inner)
+		return reflect.SliceOf(elemType)
+	}
+	if strings.HasPrefix(colType, "set<") {
+		inner := colType[4 : len(colType)-1]
+		elemType := m.getGoType(inner)
+		return reflect.SliceOf(elemType)
+	}
+	if strings.HasPrefix(colType, "map<") {
+		parts := splitTypeParams(colType[4 : len(colType)-1])
+		if len(parts) != 2 {
+			return reflect.TypeOf(map[string]interface{}{})
+		}
+		keyType := m.getGoType(parts[0])
+		valType := m.getGoType(parts[1])
+		return reflect.MapOf(keyType, valType)
+	}
+
+	// Basic types
+	switch {
+	case colType == "text" || colType == "varchar" || colType == "ascii":
+		return reflect.TypeOf("")
+	case colType == "int":
+		return reflect.TypeOf(int(0))
+	case colType == "bigint" || colType == "counter" || colType == "time":
+		return reflect.TypeOf(int64(0))
+	case colType == "blob":
+		return reflect.TypeOf([]byte{})
+	case colType == "boolean":
+		return reflect.TypeOf(true)
+	case colType == "float":
+		return reflect.TypeOf(float32(0))
+	case colType == "double":
+		return reflect.TypeOf(float64(0))
+	case colType == "decimal":
+		return reflect.TypeOf(inf.Dec{})
+	case colType == "timestamp":
+		return reflect.TypeOf(time.Time{})
+	case colType == "date":
+		return reflect.TypeOf(time.Time{})
+	case colType == "uuid" || colType == "timeuuid":
+		return reflect.TypeOf(gocql.UUID{})
+	case colType == "inet":
+		return reflect.TypeOf("")
+	case colType == "varint":
+		return reflect.TypeOf(big.Int{})
+	case colType == "smallint":
+		return reflect.TypeOf(int16(0))
+	case colType == "tinyint":
+		return reflect.TypeOf(int8(0))
+	default:
+		return reflect.TypeOf("")
+	}
+}
+
+func splitTypeParams(s string) []string {
+	var parts []string
+	start := 0
+	depth := 0
+	for i, c := range s {
+		switch c {
+		case '<':
+			depth++
+		case '>':
+			depth--
+		case ',':
+			if depth == 0 {
+				parts = append(parts, strings.TrimSpace(s[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, strings.TrimSpace(s[start:]))
+	return parts
 }
