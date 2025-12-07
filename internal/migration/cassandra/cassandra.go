@@ -179,9 +179,9 @@ func (m *CassandraMigration) Close() error {
 
 func (m *CassandraMigration) Run(ctx context.Context) error {
 	// 输出全局配置信息
-	logrus.Infof(i18n.Tr("开始执行数据查询，批次大小: %d, 全局限速: %d 行/秒",
-		"Starting data query, batch size: %d, global rate limit: %d rows/sec"),
-		m.config.Migration.BatchSize, m.config.Migration.RateLimit)
+	logrus.Infof(i18n.Tr("开始执行数据查询，读取页大小: %d, 写入批次: %d, 全局限速: %d 行/秒",
+		"Starting data query, read page size: %d, write batch: %d, global rate limit: %d rows/sec"),
+		m.config.Migration.BatchSize, m.config.Migration.WriteBatchSize, m.config.Migration.RateLimit)
 
 	// 依次迁移表
 	for _, table := range m.config.Source.Tables {
@@ -274,7 +274,7 @@ func (m *CassandraMigration) migrateTable(ctx context.Context, table config.Tabl
 			ranges = []migration.TokenRange{{Start: 0, End: 0, Complete: false}}
 			logrus.Infof(i18n.Tr("使用自定义 WHERE 条件: %s", "Using custom WHERE condition: %s"), table.Where)
 		} else {
-			// 建议范围数量为 workers 的倍数，例如 4 倍
+			// 范围数量为 workers 的 4 倍，使数据分布更均匀
 			numWorkers := m.config.Migration.Workers
 			if numWorkers <= 0 {
 				numWorkers = 4
@@ -766,7 +766,7 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 	logrus.Debugf(i18n.Tr("列数: %d, 主键列数: %d, TTL列数: %d", "Column count: %d, primary key column count: %d, TTL column count: %d"), len(columns), len(columns)-ttlCount, ttlCount)
 
 	// 初始化并发控制
-	numWorkers := 16
+	numWorkers := 4
 	jobs := make(chan BatchJob, numWorkers*2)
 	results := make(chan BatchResult, numWorkers*2)
 	var wg sync.WaitGroup
@@ -845,9 +845,6 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 	var currentKey map[string]string
 
 	for dataIter.Scan(valuePointers...) {
-		if err := migration.EnforceGlobalRateLimit(ctx, 1); err != nil {
-			return tokenRange, err
-		}
 
 		// 提取数据值
 		var dataValues []interface{}
@@ -941,7 +938,11 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 		batch.Query(insertQuery, dataValues...)
 		count++
 
-		if count >= m.config.Migration.BatchSize {
+		if count >= m.config.Migration.WriteBatchSize {
+			// 在提交批次前进行限速
+			if err := migration.EnforceGlobalRateLimit(ctx, count); err != nil {
+				return tokenRange, err
+			}
 			jobs <- BatchJob{
 				Batch:   batch,
 				LastKey: currentKey,
@@ -956,6 +957,10 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 
 	// 处理最后一批数据
 	if count > 0 {
+		// 对最后一批也进行限速
+		if err := migration.EnforceGlobalRateLimit(ctx, count); err != nil {
+			return tokenRange, err
+		}
 		jobs <- BatchJob{
 			Batch:   batch,
 			LastKey: currentKey,

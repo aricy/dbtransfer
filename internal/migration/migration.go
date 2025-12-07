@@ -232,14 +232,14 @@ func InitGlobalLimiter(rateLimit int) {
 	defer globalRateMutex.Unlock()
 
 	if rateLimit > 0 {
-		// 使用 rate.Limiter，burst 设为 rateLimit 以允许初始突发，同时保持平均速率
-		// burst 至少设为 100 以处理多 worker 并发情况
-		burst := rateLimit
+		// burst 设为速率的 1/10，最小 100，最大 1000
+		// 这样可以允许短暂突发但保持整体速率稳定
+		burst := rateLimit / 10
 		if burst < 100 {
 			burst = 100
 		}
-		if burst > 10000 {
-			burst = 10000
+		if burst > 1000 {
+			burst = 1000
 		}
 		globalRateLimiter = rate.NewLimiter(rate.Limit(rateLimit), burst)
 	} else {

@@ -38,7 +38,8 @@ type ColumnTransformation struct {
 }
 
 type MigrationConfig struct {
-	BatchSize              int    `yaml:"batch_size"`
+	BatchSize              int    `yaml:"batch_size"`       // 读取页面大小
+	WriteBatchSize         int    `yaml:"write_batch_size"` // 写入批次大小，默认 50（ScyllaDB 推荐小批次）
 	Workers                int    `yaml:"workers"`
 	RateLimit              int    `yaml:"rate_limit"`
 	Timeout                int    `yaml:"timeout"`
@@ -56,6 +57,9 @@ type MigrationConfig struct {
 func (c *MigrationConfig) SetDefaults() {
 	if c.BatchSize <= 0 {
 		c.BatchSize = 1000
+	}
+	if c.WriteBatchSize <= 0 {
+		c.WriteBatchSize = 50 // ScyllaDB 推荐小批次写入
 	}
 	if c.Workers <= 0 {
 		c.Workers = 4
