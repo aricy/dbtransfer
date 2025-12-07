@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -80,15 +81,19 @@ type CassandraMigration struct {
 	statsMutex         sync.RWMutex
 	maxRetries         int
 	retryDelay         time.Duration
-	lastID             interface{}
 	lastCheckpointTime time.Time // 上次保存断点的时间
 }
 
-type TokenRange struct {
-	Start    int64             `json:"start"`
-	End      int64             `json:"end"`
-	LastKey  map[string]string `json:"last_key,omitempty"`
-	Complete bool              `json:"complete"`
+// TableInfo 缓存表的元数据，避免重复查询
+type TableInfo struct {
+	Columns           []gocql.ColumnInfo
+	ColumnTypes       map[string]string
+	PkMap             map[string]bool
+	PartitionKeys     map[string]bool
+	TTLMode           string
+	TTLValue          int
+	TableConfig       config.TableMapping
+	PartitionKeyNames []string // 排序后的分区键名称
 }
 
 func NewMigration(config *config.Config) (migration.Migration, error) {
@@ -173,78 +178,37 @@ func (m *CassandraMigration) Close() error {
 }
 
 func (m *CassandraMigration) Run(ctx context.Context) error {
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(m.config.Source.Tables))
-
-	// 创建工作池
-	workers := m.config.Migration.Workers
-	if workers <= 0 {
-		workers = 4 // 默认值
-	}
-	semaphore := make(chan struct{}, workers)
-	logrus.Infof(i18n.Tr("使用 %d 个工作线程进行并发迁移", "Using %d worker threads for concurrent migration"), workers)
-
 	// 输出全局配置信息
 	logrus.Infof(i18n.Tr("开始执行数据查询，批次大小: %d, 全局限速: %d 行/秒",
 		"Starting data query, batch size: %d, global rate limit: %d rows/sec"),
 		m.config.Migration.BatchSize, m.config.Migration.RateLimit)
 
-	// 并发迁移表
+	// 依次迁移表
 	for _, table := range m.config.Source.Tables {
-		wg.Add(1)
-		go func(table config.TableMapping) {
-			defer wg.Done()
+		// 初始化表的统计信息
+		stats := migration.NewMigrationStats(0, m.config.Migration.ProgressInterval, table.Name)
+		m.statsMutex.Lock()
+		m.statsMap[table.Name] = stats
+		m.statsMutex.Unlock()
 
-			// 获取信号量
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
+		stats.StartReporting(time.Duration(m.config.Migration.ProgressInterval) * time.Second)
 
-			// 初始化表的统计信息
-			stats := migration.NewMigrationStats(0, m.config.Migration.ProgressInterval, table.Name)
-			m.statsMutex.Lock()
-			m.statsMap[table.Name] = stats
-			m.statsMutex.Unlock()
+		err := m.migrateTable(ctx, table)
 
-			stats.StartReporting(time.Duration(m.config.Migration.ProgressInterval) * time.Second)
-			defer func() {
-				m.statsMutex.Lock()
-				delete(m.statsMap, table.Name)
-				m.statsMutex.Unlock()
-				stats.StopReporting()
-			}()
+		m.statsMutex.Lock()
+		delete(m.statsMap, table.Name)
+		m.statsMutex.Unlock()
+		stats.StopReporting()
 
-			if err := m.migrateTable(ctx, table); err != nil {
-				errChan <- fmt.Errorf(i18n.Tr("迁移表 %s 失败: %v", "Failed to migrate table %s: %v"), table.Name, err)
-			}
-		}(table)
-	}
-
-	wg.Wait()
-	close(errChan)
-
-	// 收集错误
-	var errors []string
-	for err := range errChan {
-		errors = append(errors, err.Error())
-	}
-
-	if len(errors) > 0 {
-		return fmt.Errorf(i18n.Tr("迁移过程中发生错误:\n%s", "Errors occurred during migration:\n%s"), strings.Join(errors, "\n"))
+		if err != nil {
+			return fmt.Errorf(i18n.Tr("迁移表 %s 失败: %v", "Failed to migrate table %s: %v"), table.Name, err)
+		}
 	}
 
 	return nil
 }
 
 func (m *CassandraMigration) migrateTable(ctx context.Context, table config.TableMapping) error {
-	// 首先检查断点
-	checkpoint, err := m.loadCheckpoint(table.Name)
-	if err != nil {
-		logrus.Infof(i18n.Tr("加载断点信息失败: %v, 将从头开始迁移", "Failed to load checkpoint: %v, will start migration from beginning"), err)
-	} else if checkpoint != nil && checkpoint.Complete {
-		logrus.Infof(i18n.Tr("表 %s 已完成迁移，跳过", "Table %s migration completed, skipping"), table.Name)
-		return nil
-	}
-
 	// 首先检查表是否存在
 	keyspace := m.config.Source.Keyspace
 	tableExistsQuery := fmt.Sprintf(`
@@ -289,7 +253,169 @@ func (m *CassandraMigration) migrateTable(ctx context.Context, table config.Tabl
 		return fmt.Errorf(i18n.Tr("创建目标表失败: %v", "Failed to create target table: %v"), err)
 	}
 
-	return m.copyData(ctx, table.Name, targetName, checkpoint)
+	// 加载断点
+	checkpoint, err := m.loadCheckpoint(table.Name)
+	if err != nil {
+		logrus.Warnf(i18n.Tr("加载断点失败: %v, 将重新开始", "Failed to load checkpoint: %v, restarting"), err)
+	}
+
+	var ranges []migration.TokenRange
+	if checkpoint != nil && len(checkpoint.Ranges) > 0 {
+		ranges = checkpoint.Ranges
+		if checkpoint.Complete {
+			logrus.Infof(i18n.Tr("表 %s 已完成迁移", "Table %s migration completed"), table.Name)
+			return nil
+		}
+		logrus.Infof(i18n.Tr("从断点恢复，剩余 %d 个范围", "Resuming from checkpoint, %d ranges remaining"), countIncompleteRanges(ranges))
+	} else {
+		// 初始化 Token Ranges
+		// 建议范围数量为 workers 的倍数，例如 4 倍
+		numWorkers := m.config.Migration.Workers
+		if numWorkers <= 0 {
+			numWorkers = 4
+		}
+		numRanges := numWorkers * 4
+		ranges = m.splitTokenRing(numRanges)
+		logrus.Infof(i18n.Tr("初始化 %d 个 Token 范围", "Initialized %d token ranges"), len(ranges))
+	}
+
+	// 创建任务通道
+	rangeChan := make(chan migration.TokenRange, len(ranges))
+	updateChan := make(chan migration.TokenRange, len(ranges))
+
+	// 启动 Checkpoint 保存协程
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(time.Second * 5)
+		defer ticker.Stop()
+
+		// 使用 map 快速更新 range 状态
+		rangeMap := make(map[int64]*migration.TokenRange)
+		for i := range ranges {
+			rangeMap[ranges[i].Start] = &ranges[i]
+		}
+
+		dirty := false
+
+		for {
+			select {
+			case r, ok := <-updateChan:
+				if !ok {
+					// 通道关闭，保存最终状态
+					if dirty {
+						if err := m.saveCheckpoint(table.Name, ranges, false); err != nil {
+							logrus.Warnf("Failed to save checkpoint on close: %v", err)
+						}
+					}
+					return
+				}
+				if target, ok := rangeMap[r.Start]; ok {
+					*target = r
+					dirty = true
+				}
+			case <-ticker.C:
+				if dirty {
+					if err := m.saveCheckpoint(table.Name, ranges, false); err != nil {
+						logrus.Warnf("Failed to save checkpoint: %v", err)
+					}
+					dirty = false
+				}
+			case <-ctx.Done():
+				// 保存最终状态再退出
+				if dirty {
+					if err := m.saveCheckpoint(table.Name, ranges, false); err != nil {
+						logrus.Warnf("Failed to save checkpoint on cancel: %v", err)
+					}
+				}
+				return
+			}
+		}
+	}()
+
+	// 启动工作池
+	numWorkers := m.config.Migration.Workers
+	if numWorkers <= 0 {
+		numWorkers = 4
+	}
+
+	// 获取表元数据（只查询一次）
+	tableInfo, err := m.getTableInfo(table.Name)
+	if err != nil {
+		return fmt.Errorf(i18n.Tr("获取表信息失败: %v", "Failed to get table info: %v"), err)
+	}
+
+	workerWg := sync.WaitGroup{}
+	for i := 0; i < numWorkers; i++ {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			for r := range rangeChan {
+				if r.Complete {
+					continue
+				}
+
+				updatedRange, err := m.copyData(ctx, table.Name, targetName, r, updateChan, tableInfo)
+				if err != nil {
+					logrus.Errorf(i18n.Tr("处理范围 %d-%d 失败: %v", "Failed to process range %d-%d: %v"), r.Start, r.End, err)
+				} else {
+					updateChan <- updatedRange
+				}
+			}
+		}()
+	}
+
+	// 发送任务
+	for _, r := range ranges {
+		if !r.Complete {
+			rangeChan <- r
+		}
+	}
+	close(rangeChan)
+
+	// 等待所有工作完成
+	workerWg.Wait()
+	close(updateChan)
+	<-done // 等待 checkpoint 保存完成
+
+	// 检查是否所有范围都完成了
+	allComplete := true
+	for _, r := range ranges {
+		if !r.Complete {
+			allComplete = false
+			break
+		}
+	}
+
+	if allComplete {
+		if err := m.saveCheckpoint(table.Name, ranges, true); err != nil {
+			return err
+		}
+		// 输出最终统计
+		m.statsMutex.RLock()
+		stats := m.statsMap[table.Name]
+		var totalRows int64
+		if stats != nil {
+			totalRows = stats.ProcessedRows
+		}
+		m.statsMutex.RUnlock()
+		logrus.Infof(i18n.Tr("表 %s 迁移完成，总计 %d 行", "Table %s migration completed, total %d rows"), table.Name, totalRows)
+	} else {
+		return fmt.Errorf(i18n.Tr("表 %s 迁移未完全完成", "Table %s migration not fully completed"), table.Name)
+	}
+
+	return nil
+}
+
+func countIncompleteRanges(ranges []migration.TokenRange) int {
+	count := 0
+	for _, r := range ranges {
+		if !r.Complete {
+			count++
+		}
+	}
+	return count
 }
 
 func (m *CassandraMigration) migrateDependencies() error {
@@ -488,100 +614,20 @@ func (m *CassandraMigration) worker(ctx context.Context, jobs <-chan BatchJob, r
 	}
 }
 
-func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetName string, checkpoint *migration.Checkpoint) error {
+func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetName string, tokenRange migration.TokenRange, updateChan chan<- migration.TokenRange, tableInfo *TableInfo) (migration.TokenRange, error) {
 	// 在开始处检查完成标记
-	if checkpoint != nil && checkpoint.Complete {
-		logrus.Infof(i18n.Tr("表 %s 已完成迁移，跳过执行", "Table %s migration completed, skipping"), sourceName)
-		return nil
+	if tokenRange.Complete {
+		return tokenRange, nil
 	}
 
-	// 首先获取表的列信息
-	keyspace := m.config.Source.Keyspace
-	columnsQuery := fmt.Sprintf(`
-		SELECT column_name, type 
-		FROM system_schema.columns 
-		WHERE keyspace_name = '%s' 
-		AND table_name = '%s'`, keyspace, sourceName)
-
-	logrus.Infof(i18n.Tr("执行列信息查询: %s", "Executing column information query: %s"), columnsQuery)
-
-	iter := m.source.Query(columnsQuery).Iter()
-	var colName, colType string
-	columns := make([]gocql.ColumnInfo, 0)
-	columnTypes := make(map[string]string)
-
-	for iter.Scan(&colName, &colType) {
-		logrus.Debugf(i18n.Tr("发现列: %s (类型: %s)", "Found column: %s (type: %s)"), colName, colType)
-		columns = append(columns, gocql.ColumnInfo{
-			Name: colName,
-		})
-		columnTypes[colName] = colType
-	}
-
-	if err := iter.Close(); err != nil {
-		return fmt.Errorf(i18n.Tr("获取列信息失败: %v", "Failed to get column information: %v"), err)
-	}
-
-	if len(columns) == 0 {
-		return fmt.Errorf(i18n.Tr("表 %s.%s 中没有找到任何列", "No columns found in table %s.%s"), keyspace, sourceName)
-	}
-
-	logrus.Infof(i18n.Tr("成功获取到 %d 个列", "Successfully got %d columns"), len(columns))
-
-	// 获取所有列信息
-	schemaQuery := fmt.Sprintf(`
-		SELECT column_name, kind, position
-		FROM system_schema.columns
-		WHERE keyspace_name = '%s'
-		AND table_name = '%s'`,
-		keyspace, sourceName)
-
-	pkMap := make(map[string]bool)
-	partitionKeys := make(map[string]bool)
-
-	// 获取所有列信息
-	schemaIter := m.source.Query(schemaQuery).Iter()
-	var kind string
-	var position int
-
-	for schemaIter.Scan(&colName, &kind, &position) {
-		switch kind {
-		case "partition_key":
-			pkMap[colName] = true
-			partitionKeys[colName] = true
-			logrus.Debugf(i18n.Tr("分区键: %s", "Partition key: %s"), colName)
-		case "clustering":
-			pkMap[colName] = true
-			logrus.Debugf(i18n.Tr("聚集键: %s", "Clustering key: %s"), colName)
-		}
-	}
-
-	if err := schemaIter.Close(); err != nil {
-		return fmt.Errorf(i18n.Tr("获取主键信息失败: %v", "Failed to get primary key information: %v"), err)
-	}
-
-	// 如果没有找到任何主键，返回错误
-	if len(pkMap) == 0 {
-		return fmt.Errorf(i18n.Tr("表 %s 没有主键", "Table %s has no primary key"), sourceName)
-	}
-
-	// 检查是否有列转换和 TTL 配置
-	var tableConfig config.TableMapping
-	for _, t := range m.config.Source.Tables {
-		if t.Name == sourceName {
-			tableConfig = t
-			break
-		}
-	}
-
-	// 确定 TTL 模式
-	ttlMode := tableConfig.TTL.Mode
-	if ttlMode == "" {
-		ttlMode = "source" // 默认模式
-	}
-	ttlValue := tableConfig.TTL.Value
-
-	logrus.Infof(i18n.Tr("表 %s TTL 模式: %s, 值: %d", "Table %s TTL mode: %s, value: %d"), sourceName, ttlMode, ttlValue)
+	// 使用缓存的表信息
+	columns := tableInfo.Columns
+	columnTypes := tableInfo.ColumnTypes
+	pkMap := tableInfo.PkMap
+	partitionKeys := tableInfo.PartitionKeys
+	ttlMode := tableInfo.TTLMode
+	ttlValue := tableInfo.TTLValue
+	tableConfig := tableInfo.TableConfig
 
 	// 构建查询，包括列转换
 	queryParts := make([]string, 0, len(columns))
@@ -628,16 +674,14 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 		m.config.Source.Keyspace,
 		sourceName)
 
-	logrus.Infof(i18n.Tr("完整查询语句: %s", "Full query: %s"), query)
-
-	// 只处理断点续传的位置
-	if checkpoint != nil && len(checkpoint.LastKey) > 0 && !checkpoint.Complete {
-		whereClause := m.buildWhereClause(columnTypes, sourceName)
-		if whereClause != "" {
-			query = fmt.Sprintf("%s WHERE %s", query, whereClause)
-			logrus.Infof(i18n.Tr("从断点继续: %s", "Continuing from checkpoint: %s"), whereClause)
-		}
+	// 构建 Where 子句
+	whereClause, err := m.buildRangeWhereClauseWithPKs(tokenRange, tableInfo.PartitionKeyNames)
+	if err != nil {
+		return tokenRange, fmt.Errorf(i18n.Tr("构建查询条件失败: %v", "Failed to build query condition: %v"), err)
 	}
+
+	query = fmt.Sprintf("%s WHERE %s", query, whereClause)
+	logrus.Debugf(i18n.Tr("范围查询: %s", "Range query: %s"), query)
 
 	// 为所有列创建值存储（包括TTL列）
 	values := make([]interface{}, len(columns))             // 只存储列值
@@ -667,7 +711,7 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 		logrus.Debugf(i18n.Tr("列 %s (类型: %s) 使用接收器类型: %T", "Column %s (type: %s) uses receiver type: %T"), col.Name, colType, values[i])
 	}
 
-	logrus.Infof(i18n.Tr("总列数: %d (数据列: %d, TTL列: %d)", "Total columns: %d (data columns: %d, TTL columns: %d)"),
+	logrus.Debugf(i18n.Tr("总列数: %d (数据列: %d, TTL列: %d)", "Total columns: %d (data columns: %d, TTL columns: %d)"),
 		len(values), len(queryParts), len(queryParts))
 
 	// 执行数据查询
@@ -724,7 +768,9 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 
 	// 启动提交协程
 	commitDone := make(chan error, 1)
-	var finalKey map[string]string
+
+	// 启动提交协程
+	// (上面已声明 commitDone)
 
 	go func() {
 		defer close(commitDone)
@@ -732,15 +778,15 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 		nextIndex := 0
 		buffer := make(map[int]BatchResult)
 
-		checkpointTicker := time.NewTicker(time.Second)
-		defer checkpointTicker.Stop()
+		// 定期更新进度
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
 
 		for {
 			select {
 			case result, ok := <-results:
 				if !ok {
 					// 所有结果已处理
-					finalKey = lastProcessedKey
 					return
 				}
 
@@ -763,16 +809,12 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 					}
 				}
 
-			case <-checkpointTicker.C:
-				// 保存断点
-				if stats, ok := m.statsMap[sourceName]; ok {
-					stats.Lock()
-					if lastProcessedKey != nil {
-						if err := m.saveCheckpoint(sourceName, lastProcessedKey, false); err != nil {
-							logrus.Warnf(i18n.Tr("保存断点失败: %v", "Failed to save checkpoint: %v"), err)
-						}
-					}
-					stats.Unlock()
+			case <-ticker.C:
+				// 发送进度更新
+				if lastProcessedKey != nil {
+					tokenRange.LastKey = lastProcessedKey
+					// 注意：这里发送的是副本，避免并发问题
+					updateChan <- tokenRange
 				}
 
 			case <-ctx.Done():
@@ -789,8 +831,8 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 	var currentKey map[string]string
 
 	for dataIter.Scan(valuePointers...) {
-		if err := m.limiter.Wait(ctx); err != nil {
-			return err
+		if err := migration.EnforceGlobalRateLimit(ctx, 1); err != nil {
+			return tokenRange, err
 		}
 
 		// 提取数据值
@@ -915,35 +957,19 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 
 	// 等待提交协程完成
 	if err := <-commitDone; err != nil {
-		return err
+		return tokenRange, err
 	}
 
 	// 如果迭代器没有错误，说明已经处理完所有数据，标记为完成
 	if err := dataIter.Close(); err != nil {
-		return fmt.Errorf(i18n.Tr("查询执行失败: %v", "Query execution failed: %v"), err)
-	}
-
-	// 更新最终进度
-	if stats, ok := m.statsMap[sourceName]; ok {
-		stats.StopReporting()
-		stats.Report()
+		return tokenRange, fmt.Errorf(i18n.Tr("查询执行失败: %v", "Query execution failed: %v"), err)
 	}
 
 	// 标记为完成
-	logrus.Infof(i18n.Tr("表 %s 迁移完成，标记为完成状态", "Table %s migration completed, marking as completed state"), sourceName)
-	completionKey := make(map[string]string)
-	for k, v := range finalKey {
-		completionKey[k] = v
-	}
+	tokenRange.Complete = true
+	tokenRange.LastKey = nil // 完成后不需要 LastKey
 
-	if err := m.saveCheckpoint(sourceName, completionKey, true); err != nil {
-		logrus.Errorf(i18n.Tr("保存完成标记失败: %v", "Failed to save completion marker: %v"), err)
-		return fmt.Errorf(i18n.Tr("保存完成标记失败: %v", "Failed to save completion marker: %v"), err)
-	}
-
-	logrus.Infof(i18n.Tr("表 %s 迁移完成并已保存完成标记", "Table %s migration completed and completion marker saved"), sourceName)
-
-	return nil
+	return tokenRange, nil
 }
 
 func (m *CassandraMigration) executeBatchWithRetry(batch *gocql.Batch) error {
@@ -1094,7 +1120,7 @@ func (m *CassandraMigration) loadCheckpointFile(tableName string) (*migration.Ch
 	return &checkpoint, nil
 }
 
-func (m *CassandraMigration) saveCheckpoint(tableName string, lastKey map[string]string, completed bool) error {
+func (m *CassandraMigration) saveCheckpoint(tableName string, ranges []migration.TokenRange, completed bool) error {
 	if m.config.Migration.CheckpointDir == "" {
 		return nil
 	}
@@ -1105,7 +1131,7 @@ func (m *CassandraMigration) saveCheckpoint(tableName string, lastKey map[string
 	}
 
 	checkpoint := &migration.Checkpoint{
-		LastKey:     lastKey,
+		Ranges:      ranges,
 		LastUpdated: time.Now(),
 		Complete:    completed,
 	}
@@ -1123,6 +1149,40 @@ func (m *CassandraMigration) saveCheckpoint(tableName string, lastKey map[string
 	}
 
 	return nil
+}
+
+func (m *CassandraMigration) splitTokenRing(numRanges int) []migration.TokenRange {
+	ranges := make([]migration.TokenRange, 0, numRanges)
+
+	// Cassandra Murmur3Partitioner token range: -2^63 to 2^63-1
+	minToken := new(big.Int).SetInt64(math.MinInt64)
+	maxToken := new(big.Int).SetInt64(math.MaxInt64)
+
+	// Total range size = 2^64
+	totalSize := new(big.Int).Sub(maxToken, minToken)
+
+	step := new(big.Int).Div(totalSize, big.NewInt(int64(numRanges)))
+
+	current := new(big.Int).Set(minToken)
+
+	for i := 0; i < numRanges; i++ {
+		next := new(big.Int).Add(current, step)
+
+		// Ensure we don't exceed maxToken for the last range
+		if i == numRanges-1 {
+			next = maxToken
+		}
+
+		ranges = append(ranges, migration.TokenRange{
+			Start:    current.Int64(),
+			End:      next.Int64(),
+			Complete: false,
+		})
+
+		current = next
+	}
+
+	return ranges
 }
 
 func (m *CassandraMigration) buildWhereClause(columnTypes map[string]string, tableName string) string {
@@ -1412,4 +1472,181 @@ func splitTypeParams(s string) []string {
 	}
 	parts = append(parts, strings.TrimSpace(s[start:]))
 	return parts
+}
+
+func (m *CassandraMigration) buildRangeWhereClause(tableName string, r migration.TokenRange, pkMap map[string]bool) (string, error) {
+	// 获取分区键
+	pks, err := m.getPartitionKeys(tableName)
+	if err != nil {
+		return "", err
+	}
+
+	tokenFunc := fmt.Sprintf("token(%s)", strings.Join(pks, ", "))
+
+	startToken := fmt.Sprintf("%d", r.Start)
+	endToken := fmt.Sprintf("%d", r.End)
+
+	// 使用 token(pk) > start AND token(pk) <= end
+	return fmt.Sprintf("%s > %s AND %s <= %s", tokenFunc, startToken, tokenFunc, endToken), nil
+}
+
+func (m *CassandraMigration) getPartitionKeys(tableName string) ([]string, error) {
+	// 查询所有列，在 Go 代码中过滤，避免 ALLOW FILTERING
+	query := fmt.Sprintf(`
+		SELECT column_name, kind, position
+		FROM system_schema.columns 
+		WHERE keyspace_name = '%s' 
+		AND table_name = '%s'`,
+		m.config.Source.Keyspace, tableName)
+
+	iter := m.source.Query(query).Iter()
+	var columnName, kind string
+	var position int
+
+	type pkInfo struct {
+		name     string
+		position int
+	}
+	var pks []pkInfo
+
+	for iter.Scan(&columnName, &kind, &position) {
+		// 只收集 partition_key 类型的列
+		if kind == "partition_key" {
+			pks = append(pks, pkInfo{fmt.Sprintf("\"%s\"", columnName), position})
+		}
+	}
+
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to get partition keys: %v", err)
+	}
+
+	sort.Slice(pks, func(i, j int) bool {
+		return pks[i].position < pks[j].position
+	})
+
+	result := make([]string, len(pks))
+	for i, pk := range pks {
+		result[i] = pk.name
+	}
+
+	return result, nil
+}
+
+func (m *CassandraMigration) buildRangeWhereClauseWithPKs(r migration.TokenRange, partitionKeyNames []string) (string, error) {
+	tokenFunc := fmt.Sprintf("token(%s)", strings.Join(partitionKeyNames, ", "))
+
+	startToken := fmt.Sprintf("%d", r.Start)
+	endToken := fmt.Sprintf("%d", r.End)
+
+	// 使用 token(pk) > start AND token(pk) <= end
+	return fmt.Sprintf("%s > %s AND %s <= %s", tokenFunc, startToken, tokenFunc, endToken), nil
+}
+
+func (m *CassandraMigration) getTableInfo(tableName string) (*TableInfo, error) {
+	keyspace := m.config.Source.Keyspace
+
+	// 查询列信息
+	columnsQuery := fmt.Sprintf(`
+		SELECT column_name, type 
+		FROM system_schema.columns 
+		WHERE keyspace_name = '%s' 
+		AND table_name = '%s'`, keyspace, tableName)
+
+	iter := m.source.Query(columnsQuery).Iter()
+	var colName, colType string
+	columns := make([]gocql.ColumnInfo, 0)
+	columnTypes := make(map[string]string)
+
+	for iter.Scan(&colName, &colType) {
+		columns = append(columns, gocql.ColumnInfo{Name: colName})
+		columnTypes[colName] = colType
+	}
+
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf(i18n.Tr("获取列信息失败: %v", "Failed to get column information: %v"), err)
+	}
+
+	if len(columns) == 0 {
+		return nil, fmt.Errorf(i18n.Tr("表 %s.%s 中没有找到任何列", "No columns found in table %s.%s"), keyspace, tableName)
+	}
+
+	logrus.Infof(i18n.Tr("成功获取到 %d 个列", "Successfully got %d columns"), len(columns))
+
+	// 查询主键信息
+	schemaQuery := fmt.Sprintf(`
+		SELECT column_name, kind, position
+		FROM system_schema.columns
+		WHERE keyspace_name = '%s'
+		AND table_name = '%s'`,
+		keyspace, tableName)
+
+	pkMap := make(map[string]bool)
+	partitionKeys := make(map[string]bool)
+
+	type pkInfo struct {
+		name     string
+		position int
+	}
+	var pks []pkInfo
+
+	schemaIter := m.source.Query(schemaQuery).Iter()
+	var kind string
+	var position int
+
+	for schemaIter.Scan(&colName, &kind, &position) {
+		switch kind {
+		case "partition_key":
+			pkMap[colName] = true
+			partitionKeys[colName] = true
+			pks = append(pks, pkInfo{fmt.Sprintf("\"%s\"", colName), position})
+		case "clustering":
+			pkMap[colName] = true
+		}
+	}
+
+	if err := schemaIter.Close(); err != nil {
+		return nil, fmt.Errorf(i18n.Tr("获取主键信息失败: %v", "Failed to get primary key information: %v"), err)
+	}
+
+	if len(pkMap) == 0 {
+		return nil, fmt.Errorf(i18n.Tr("表 %s 没有主键", "Table %s has no primary key"), tableName)
+	}
+
+	// 按 position 排序分区键
+	sort.Slice(pks, func(i, j int) bool {
+		return pks[i].position < pks[j].position
+	})
+
+	partitionKeyNames := make([]string, len(pks))
+	for i, pk := range pks {
+		partitionKeyNames[i] = pk.name
+	}
+
+	// 获取表配置
+	var tableConfig config.TableMapping
+	for _, t := range m.config.Source.Tables {
+		if t.Name == tableName {
+			tableConfig = t
+			break
+		}
+	}
+
+	// 确定 TTL 模式
+	ttlMode := tableConfig.TTL.Mode
+	if ttlMode == "" {
+		ttlMode = "source"
+	}
+
+	logrus.Infof(i18n.Tr("表 %s TTL 模式: %s, 值: %d", "Table %s TTL mode: %s, value: %d"), tableName, ttlMode, tableConfig.TTL.Value)
+
+	return &TableInfo{
+		Columns:           columns,
+		ColumnTypes:       columnTypes,
+		PkMap:             pkMap,
+		PartitionKeys:     partitionKeys,
+		TTLMode:           ttlMode,
+		TTLValue:          tableConfig.TTL.Value,
+		TableConfig:       tableConfig,
+		PartitionKeyNames: partitionKeyNames,
+	}, nil
 }

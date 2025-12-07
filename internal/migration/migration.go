@@ -26,11 +26,22 @@ type TableMapping struct {
 	TargetName string `yaml:"target_name,omitempty"`
 }
 
+// TokenRange 定义 Token 范围
+type TokenRange struct {
+	Start    int64             `json:"start"`
+	End      int64             `json:"end"`
+	LastKey  map[string]string `json:"last_key,omitempty"`
+	Complete bool              `json:"complete"`
+}
+
 // Checkpoint 定义断点信息
 type Checkpoint struct {
-	LastKey     map[string]string `json:"last_key"`
-	LastUpdated time.Time         `json:"last_updated"`
-	Complete    bool              `json:"complete"`
+	Ranges      []TokenRange `json:"ranges"`
+	LastUpdated time.Time    `json:"last_updated"`
+	Complete    bool         `json:"complete"`
+	// Keep LastKey for backward compatibility or global state if needed,
+	// but Ranges will be the primary source of truth for parallel migration.
+	LastKey map[string]string `json:"last_key,omitempty"`
 }
 
 // MigrationStats 定义迁移统计信息
