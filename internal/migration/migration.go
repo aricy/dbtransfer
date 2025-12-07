@@ -12,6 +12,7 @@ import (
 	"dbtransfer/internal/i18n"
 
 	"github.com/sirupsen/logrus"
+	"golang.org/x/time/rate"
 )
 
 // Migration 定义数据迁移接口
@@ -221,58 +222,44 @@ func InitLogger(logFile string, logLevel string) error {
 
 // 添加全局限速器
 var (
-	globalLimiter struct {
-		sync.Mutex
-		processed int64
-		lastTick  time.Time
-		rateLimit int
-	}
+	globalRateLimiter *rate.Limiter
+	globalRateMutex   sync.RWMutex
 )
 
 // InitGlobalLimiter 初始化全局限速器
 func InitGlobalLimiter(rateLimit int) {
-	globalLimiter.Lock()
-	defer globalLimiter.Unlock()
+	globalRateMutex.Lock()
+	defer globalRateMutex.Unlock()
 
-	globalLimiter.rateLimit = rateLimit
-	globalLimiter.lastTick = time.Now()
-	globalLimiter.processed = 0
+	if rateLimit > 0 {
+		// 使用 rate.Limiter，burst 设为 rateLimit 以允许初始突发，同时保持平均速率
+		// burst 至少设为 100 以处理多 worker 并发情况
+		burst := rateLimit
+		if burst < 100 {
+			burst = 100
+		}
+		if burst > 10000 {
+			burst = 10000
+		}
+		globalRateLimiter = rate.NewLimiter(rate.Limit(rateLimit), burst)
+	} else {
+		globalRateLimiter = nil
+	}
 }
 
 // EnforceGlobalRateLimit 实现全局限速
 func EnforceGlobalRateLimit(ctx context.Context, count int) error {
-	if globalLimiter.rateLimit <= 0 {
+	globalRateMutex.RLock()
+	limiter := globalRateLimiter
+	globalRateMutex.RUnlock()
+
+	if limiter == nil {
 		return nil
 	}
 
-	globalLimiter.Lock()
-	defer globalLimiter.Unlock()
-
-	globalLimiter.processed += int64(count)
-	now := time.Now()
-	elapsed := now.Sub(globalLimiter.lastTick)
-
-	currentRate := float64(globalLimiter.processed) / elapsed.Seconds()
-
-	if currentRate > float64(globalLimiter.rateLimit) {
-		idealTime := time.Duration(float64(globalLimiter.processed) / float64(globalLimiter.rateLimit) * float64(time.Second))
-		waitTime := idealTime - elapsed
-		if waitTime > 0 {
-			logrus.Debugf(i18n.Tr("全局限流: 总处理行数 %d，当前速率 %.2f 行/秒，限制 %d 行/秒，等待 %v",
-				"Global rate limiting: Total processed %d rows, current rate %.2f rows/sec, limit %d rows/sec, waiting %v"),
-				globalLimiter.processed, currentRate, globalLimiter.rateLimit, waitTime)
-
-			select {
-			case <-time.After(waitTime):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	}
-
-	if elapsed > 10*time.Second {
-		globalLimiter.processed = int64(count)
-		globalLimiter.lastTick = now
+	// 使用 WaitN 等待 count 个 token
+	if err := limiter.WaitN(ctx, count); err != nil {
+		return err
 	}
 
 	return nil

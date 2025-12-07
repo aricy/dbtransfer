@@ -269,14 +269,20 @@ func (m *CassandraMigration) migrateTable(ctx context.Context, table config.Tabl
 		logrus.Infof(i18n.Tr("从断点恢复，剩余 %d 个范围", "Resuming from checkpoint, %d ranges remaining"), countIncompleteRanges(ranges))
 	} else {
 		// 初始化 Token Ranges
-		// 建议范围数量为 workers 的倍数，例如 4 倍
-		numWorkers := m.config.Migration.Workers
-		if numWorkers <= 0 {
-			numWorkers = 4
+		// 如果配置了自定义 WHERE 条件，只需要单个范围（因为不使用 token range 扫描）
+		if table.Where != "" {
+			ranges = []migration.TokenRange{{Start: 0, End: 0, Complete: false}}
+			logrus.Infof(i18n.Tr("使用自定义 WHERE 条件: %s", "Using custom WHERE condition: %s"), table.Where)
+		} else {
+			// 建议范围数量为 workers 的倍数，例如 4 倍
+			numWorkers := m.config.Migration.Workers
+			if numWorkers <= 0 {
+				numWorkers = 4
+			}
+			numRanges := numWorkers * 4
+			ranges = m.splitTokenRing(numRanges)
+			logrus.Infof(i18n.Tr("初始化 %d 个 Token 范围", "Initialized %d token ranges"), len(ranges))
 		}
-		numRanges := numWorkers * 4
-		ranges = m.splitTokenRing(numRanges)
-		logrus.Infof(i18n.Tr("初始化 %d 个 Token 范围", "Initialized %d token ranges"), len(ranges))
 	}
 
 	// 创建任务通道
@@ -675,9 +681,17 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 		sourceName)
 
 	// 构建 Where 子句
-	whereClause, err := m.buildRangeWhereClauseWithPKs(tokenRange, tableInfo.PartitionKeyNames)
-	if err != nil {
-		return tokenRange, fmt.Errorf(i18n.Tr("构建查询条件失败: %v", "Failed to build query condition: %v"), err)
+	var whereClause string
+	if tableConfig.Where != "" {
+		// 如果配置了自定义 WHERE 条件，直接使用它（不能同时使用 token range 和主键条件）
+		whereClause = tableConfig.Where
+	} else {
+		// 否则使用 token range 条件
+		var err error
+		whereClause, err = m.buildRangeWhereClauseWithPKs(tokenRange, tableInfo.PartitionKeyNames)
+		if err != nil {
+			return tokenRange, fmt.Errorf(i18n.Tr("构建查询条件失败: %v", "Failed to build query condition: %v"), err)
+		}
 	}
 
 	query = fmt.Sprintf("%s WHERE %s", query, whereClause)
