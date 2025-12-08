@@ -23,7 +23,7 @@ import (
 	"dbtransfer/internal/migration/postgresql"
 )
 
-const VERSION = "0.2"
+const VERSION = "0.3.1"
 
 // 使用 migration 包中的接口
 type Migration = migration.Migration
