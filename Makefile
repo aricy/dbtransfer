@@ -14,7 +14,11 @@ GOVET=$(GO) vet
 GOFMT=gofmt
 
 # 编译标记
-LDFLAGS=-ldflags "-X main.Version=${VERSION} -s -w"
+BUILD_TIME=$(shell date "+%F %T")
+LDFLAGS=-ldflags "-s -w -X 'main.Version=${VERSION}' -X 'main.BuildTime=${BUILD_TIME}'"
+GCFLAGS=-gcflags="all=-trimpath=${PWD}"
+ASMFLAGS=-asmflags="all=-trimpath=${PWD}"
+BUILD_FLAGS=$(LDFLAGS) $(GCFLAGS) $(ASMFLAGS)
 
 # 操作系统和架构
 PLATFORMS=linux darwin windows
@@ -29,7 +33,7 @@ all: clean build
 build:
 	@echo "Building ${BINARY_NAME}..."
 	@mkdir -p ${BUILD_DIR}
-	$(GOBUILD) ${LDFLAGS} -o ${BUILD_DIR}/${BINARY_NAME} ${MAIN_FILE}
+	$(GOBUILD) $(BUILD_FLAGS) -o ${BUILD_DIR}/${BINARY_NAME} ${MAIN_FILE}
 
 # 清理构建文件
 clean:
@@ -73,7 +77,7 @@ build-all:
 				output_name=$${output_name}.exe; \
 			fi; \
 			echo "Building $${platform}/$${arch}..."; \
-			GOOS=$${platform} GOARCH=$${arch} $(GOBUILD) ${LDFLAGS} -o $${output_name} ${MAIN_FILE}; \
+			GOOS=$${platform} GOARCH=$${arch} $(GOBUILD) $(BUILD_FLAGS) -o $${output_name} ${MAIN_FILE}; \
 		done; \
 	done
 
@@ -81,22 +85,22 @@ build-all:
 linux-amd64:
 	@echo "Building for Linux AMD64..."
 	@mkdir -p ${BUILD_DIR}
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GOBUILD) ${LDFLAGS} -o ${BUILD_DIR}/${BINARY_NAME}.linux.x86_64 ${MAIN_FILE}
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GOBUILD) $(BUILD_FLAGS) -o ${BUILD_DIR}/${BINARY_NAME}.linux.x86_64 ${MAIN_FILE}
 
 linux-arm64:
 	@echo "Building for Linux ARM64..."
 	@mkdir -p ${BUILD_DIR}
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GOBUILD) ${LDFLAGS} -o ${BUILD_DIR}/${BINARY_NAME}.linux.aarch64 ${MAIN_FILE}
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GOBUILD) $(BUILD_FLAGS) -o ${BUILD_DIR}/${BINARY_NAME}.linux.aarch64 ${MAIN_FILE}
 
 darwin-amd64:
 	@echo "Building for macOS AMD64..."
 	@mkdir -p ${BUILD_DIR}
-	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 $(GOBUILD) ${LDFLAGS} -o ${BUILD_DIR}/${BINARY_NAME}.darwin.amd64 ${MAIN_FILE}
+	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 $(GOBUILD) $(BUILD_FLAGS) -o ${BUILD_DIR}/${BINARY_NAME}.darwin.amd64 ${MAIN_FILE}
 
 darwin-arm64:
 	@echo "Building for macOS ARM64..."
 	@mkdir -p ${BUILD_DIR}
-	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GOBUILD) ${LDFLAGS} -o ${BUILD_DIR}/${BINARY_NAME}.darwin.arm64 ${MAIN_FILE}
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GOBUILD) $(BUILD_FLAGS) -o ${BUILD_DIR}/${BINARY_NAME}.darwin.arm64 ${MAIN_FILE}
 
 # 显示帮助信息
 help:

@@ -89,7 +89,7 @@ func NewMigration(config *config.Config) (migration.Migration, error) {
 	logrus.Info(i18n.Tr("MongoDB 连接成功", "MongoDB connection successful"))
 
 	// 初始化全局限速器
-	migration.InitGlobalLimiter(config.Migration.RateLimit)
+	migration.InitGlobalLimiter(config.Migration.RateLimit, config.Migration.BatchSize)
 
 	return &MongoDBMigration{
 		source:     sourceClient,
@@ -241,8 +241,17 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, collection con
 		return nil
 	}
 
+	// 解析自定义 WHERE 条件
+	var baseFilter bson.M = bson.M{}
+	if collection.Where != "" {
+		if err := bson.UnmarshalExtJSON([]byte(collection.Where), true, &baseFilter); err != nil {
+			return fmt.Errorf(i18n.Tr("解析 WHERE 条件失败: %v", "Failed to parse WHERE clause: %v"), err)
+		}
+		logrus.Infof(i18n.Tr("使用自定义过滤条件: %s", "Using custom filter: %s"), collection.Where)
+	}
+
 	// 获取总文档数
-	totalDocs, err := sourceDB.Collection(collection.Name).CountDocuments(ctx, bson.M{})
+	totalDocs, err := sourceDB.Collection(collection.Name).CountDocuments(ctx, baseFilter)
 	if err != nil {
 		return fmt.Errorf(i18n.Tr("获取集合总文档数失败: %v", "Failed to get collection document count: %v"), err)
 	}
@@ -265,7 +274,12 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, collection con
 		if lastID, ok := checkpoint.LastKey["_id"]; ok {
 			objID, err := primitive.ObjectIDFromHex(lastID)
 			if err == nil {
-				filter = bson.M{"_id": bson.M{"$gt": objID}}
+				// 组合过滤条件
+				if len(baseFilter) > 0 {
+					filter = bson.M{"$and": []bson.M{baseFilter, {"_id": bson.M{"$gt": objID}}}}
+				} else {
+					filter = bson.M{"_id": bson.M{"$gt": objID}}
+				}
 
 				// 获取从断点位置开始的剩余文档数
 				remainingDocs, err = sourceDB.Collection(collection.Name).CountDocuments(ctx, filter)
@@ -296,7 +310,7 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, collection con
 		stats.ProcessedRows = 0
 		remainingDocs = totalDocs
 		stats.ResetStartTime(false)
-		filter = bson.M{} // 空过滤器，查询所有文档
+		filter = baseFilter // 使用基础过滤器
 	}
 
 	// 设置批处理大小

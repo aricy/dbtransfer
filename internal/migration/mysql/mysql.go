@@ -14,7 +14,6 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/time/rate"
 
 	"dbtransfer/internal/config"
 	"dbtransfer/internal/i18n"
@@ -25,11 +24,10 @@ type MySQLMigration struct {
 	source             *sql.DB
 	dest               *sql.DB
 	config             *config.Config
-	limiter            *rate.Limiter
 	statsMap           map[string]*migration.MigrationStats
+	statsMutex         sync.Mutex
 	maxRetries         int
 	retryDelay         time.Duration
-	lastID             int64     // 记录最后处理的ID
 	lastCheckpointTime time.Time // 上次保存断点的时间
 }
 
@@ -46,7 +44,7 @@ func NewMigration(config *config.Config) (migration.Migration, error) {
 
 	// 检查配置
 	if len(config.Source.Hosts) == 0 || len(config.Destination.Hosts) == 0 {
-		return nil, fmt.Errorf(i18n.Tr("未配置数据库主机地址", "Database host addresses not configured"))
+		return nil, fmt.Errorf("%s", i18n.Tr("未配置数据库主机地址", "Database host addresses not configured"))
 	}
 
 	// 创建断点目录
@@ -89,27 +87,15 @@ func NewMigration(config *config.Config) (migration.Migration, error) {
 		return nil, fmt.Errorf(i18n.Tr("连接目标数据库失败: %v", "Failed to connect to destination database: %v"), err)
 	}
 
-	// 修改限流器的初始化
-	var limiter *rate.Limiter
-	if config.Migration.RateLimit > 0 {
-		// 使用每秒限制的行数作为速率，burst 设置为批次大小的一半，确保更平滑的限流
-		burstSize := config.Migration.BatchSize / 2
-		if burstSize < 1 {
-			burstSize = 1
-		}
-		limiter = rate.NewLimiter(rate.Limit(config.Migration.RateLimit), burstSize)
-	}
-
 	logrus.Info(i18n.Tr("数据库连接成功", "Database connection successful"))
 
 	// 初始化全局限速器
-	migration.InitGlobalLimiter(config.Migration.RateLimit)
+	migration.InitGlobalLimiter(config.Migration.RateLimit, config.Migration.BatchSize)
 
 	return &MySQLMigration{
 		source:             sourceDB,
 		dest:               destDB,
 		config:             config,
-		limiter:            limiter,
 		statsMap:           make(map[string]*migration.MigrationStats),
 		maxRetries:         3,
 		retryDelay:         time.Second * 5,
@@ -130,7 +116,7 @@ func (m *MySQLMigration) Close() error {
 		}
 	}
 	if len(errs) > 0 {
-		return fmt.Errorf(strings.Join(errs, "; "))
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
 	return nil
 }
@@ -187,18 +173,36 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 	// 设置批次大小
 	batchSize := m.config.Migration.BatchSize
 
-	// 初始化 lastID
+	// 初始化 lastID (Move declaration up)
 	var lastID int64 = 0
+	var completed bool
+
+	// Move primaryKey declaration up
+	var primaryKey string
 
 	// 初始化统计信息
 	stats := migration.NewMigrationStats(0, m.config.Migration.ProgressInterval, table.Name)
+	m.statsMutex.Lock()
 	m.statsMap[table.Name] = stats
+	m.statsMutex.Unlock()
 
 	// 启动进度报告
 	stats.StartReporting(time.Duration(m.config.Migration.ProgressInterval) * time.Second)
 	defer func() {
 		stats.StopReporting()
+		m.statsMutex.Lock()
 		delete(m.statsMap, table.Name) // 清理统计信息
+		m.statsMutex.Unlock()
+		// Checkpoint save on exit (catches errors, returns, panics, etc.)
+		if lastID > 0 && !completed {
+			// Using primaryKey captured by closure
+			// Note: primaryKey will be set by the time this runs unless error happens super early
+			if primaryKey != "" {
+				if err := m.saveCheckpoint(table.Name, lastID, primaryKey, false); err != nil {
+					logrus.Warnf(i18n.Tr("退出时保存断点失败: %v", "Failed to save checkpoint on exit: %v"), err)
+				}
+			}
+		}
 	}()
 
 	logrus.Infof(i18n.Tr("开始迁移表: %s", "Starting migration of table: %s"), table.Name)
@@ -206,7 +210,37 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 		logrus.Infof(i18n.Tr("使用自定义 WHERE 条件: %s", "Using custom WHERE condition: %s"), table.Where)
 	}
 
-	// 加载断点信息
+	// 获取或使用配置的主键 (Always needed for checkpoint resumption)
+	primaryKey = table.PrimaryKey
+	if primaryKey == "" {
+		var pkErr error
+		primaryKey, pkErr = m.getPrimaryKey(table.Name)
+		if pkErr != nil {
+			return pkErr
+		}
+	}
+	logrus.Infof(i18n.Tr("使用主键: %s", "Using primary key: %s"), primaryKey)
+
+	// 获取列信息
+	columns, colErr := m.getColumns(table.Name)
+	if colErr != nil {
+		return colErr
+	}
+	logrus.Debugf(i18n.Tr("获取到的列: %v", "Retrieved columns: %v"), columns)
+
+	// Determine PK index (always needed for checkpoint)
+	pkIndex := -1
+	for i, col := range columns {
+		if col == primaryKey {
+			pkIndex = i
+			break
+		}
+	}
+	if pkIndex == -1 {
+		return fmt.Errorf("column %s not found in table %s", primaryKey, table.Name)
+	}
+
+	// 加载断点信息 (Moved after PK determination)
 	checkpoint, loadErr := m.loadCheckpoint(table.Name)
 	if loadErr != nil {
 		logrus.Infof(i18n.Tr("加载断点信息失败: %v, 将从头开始迁移",
@@ -217,36 +251,14 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 				"Table %s migration already completed, skipping"), table.Name)
 			return nil
 		}
-		// 从断点恢复
-		if idStr, ok := checkpoint.LastKey[table.Name]; ok {
+		// 从断点恢复 - Using primaryKey as key
+		if idStr, ok := checkpoint.LastKey[primaryKey]; ok {
 			if id, err := strconv.ParseInt(idStr, 10, 64); err == nil {
 				lastID = id
 				logrus.Infof(i18n.Tr("从断点继续，上次处理到 ID: %d", "Continuing from checkpoint, last processed ID: %d"), lastID)
 			}
 		}
 	}
-
-	// 获取或使用配置的主键
-	var primaryKey string
-	if table.Where == "" {
-		// 只有在没有自定义 WHERE 条件时才需要主键
-		primaryKey = table.PrimaryKey
-		if primaryKey == "" {
-			var pkErr error
-			primaryKey, pkErr = m.getPrimaryKey(table.Name)
-			if pkErr != nil {
-				return pkErr
-			}
-		}
-		logrus.Infof(i18n.Tr("使用主键: %s", "Using primary key: %s"), primaryKey)
-	}
-
-	// 获取列信息
-	columns, colErr := m.getColumns(table.Name)
-	if colErr != nil {
-		return colErr
-	}
-	logrus.Debugf(i18n.Tr("获取到的列: %v", "Retrieved columns: %v"), columns)
 
 	// 构建查询语句
 	var query string
@@ -270,15 +282,19 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 					transformedColumns = append(transformedColumns, col)
 				}
 			}
-			query = fmt.Sprintf("SELECT %s FROM %s WHERE %s",
+			query = fmt.Sprintf("SELECT %s FROM %s WHERE (%s) AND %s > ? ORDER BY %s LIMIT ?",
 				strings.Join(transformedColumns, ", "),
 				table.Name,
-				table.Where)
+				table.Where,
+				primaryKey,
+				primaryKey)
 		} else {
-			query = fmt.Sprintf("SELECT %s FROM %s WHERE %s",
+			query = fmt.Sprintf("SELECT %s FROM %s WHERE (%s) AND %s > ? ORDER BY %s LIMIT ?",
 				strings.Join(columns, ", "),
 				table.Name,
-				table.Where)
+				table.Where,
+				primaryKey,
+				primaryKey)
 		}
 	} else if primaryKey != "" {
 		// 使用主键作为条件
@@ -312,7 +328,7 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 				primaryKey)
 		}
 	} else {
-		return fmt.Errorf(i18n.Tr("未指定 WHERE 条件且无法获取主键",
+		return fmt.Errorf("%s", i18n.Tr("未指定 WHERE 条件且无法获取主键",
 			"No WHERE condition specified and unable to get primary key"))
 	}
 	logrus.Infof(i18n.Tr("执行查询: %s", "Executing query: %s"), query)
@@ -369,8 +385,9 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 		// 执行查询
 		var rows *sql.Rows
 		if table.Where != "" {
-			rows, err = m.source.Query(query)
-			logrus.Debugf(i18n.Tr("使用自定义 WHERE 条件执行查询", "Executing query with custom WHERE condition"))
+			rows, err = m.source.Query(query, lastID, batchSize)
+			logrus.Debugf(i18n.Tr("使用自定义 WHERE 条件执行查询，lastID: %d, batchSize: %d",
+				"Executing query with custom WHERE condition, lastID: %d, batchSize: %d"), lastID, batchSize)
 		} else {
 			rows, err = m.source.Query(query, lastID, batchSize)
 			logrus.Debugf(i18n.Tr("使用主键条件执行查询，lastID: %d, batchSize: %d",
@@ -400,9 +417,7 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 			}
 
 			// 添加到批次
-			for _, v := range values {
-				batch = append(batch, v)
-			}
+			batch = append(batch, values...)
 			rowCount++
 
 			// 当批次达到指定大小时执行插入
@@ -410,15 +425,38 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 				if err := m.executeBatchWithRetry(ctx, table.Name, batch); err != nil {
 					return err
 				}
+
+				// Global rate limiting
+				if err := migration.EnforceGlobalRateLimit(ctx, batchSize); err != nil {
+					return err
+				}
+
 				batch = batch[:0]
 				rowCount = 0
 			}
 
 			stats.Increment(1) // 更新统计信息
 
-			// 更新最后处理的 ID
-			if table.Where == "" {
-				lastID = values[0].(int64) // 假设第一列是主键
+			// 更新最后处理的 ID (always update for checkpoint)
+			if pkIndex >= 0 && pkIndex < len(values) {
+				// Safely get ID from the correct column
+				val := values[pkIndex]
+				if val != nil {
+					switch v := val.(type) {
+					case int64:
+						lastID = v
+					case int:
+						lastID = int64(v)
+					case []byte: // MySQL driver often returns []byte for numbers
+						if id, err := strconv.ParseInt(string(v), 10, 64); err == nil {
+							lastID = id
+						}
+					case string:
+						if id, err := strconv.ParseInt(v, 10, 64); err == nil {
+							lastID = id
+						}
+					}
+				}
 			}
 		}
 
@@ -427,10 +465,15 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 			if err := m.executeBatchWithRetry(ctx, table.Name, batch); err != nil {
 				return err
 			}
+			// Global rate limiting for remaining rows
+			if err := migration.EnforceGlobalRateLimit(ctx, rowCount); err != nil {
+				return err
+			}
 		}
 
-		// 如果是自定义 WHERE 条件或者没有获取到新数据，退出循环
-		if table.Where != "" || !hasData {
+		// 如果没有获取到新数据，退出循环
+		if !hasData {
+			completed = true
 			// 保存最终断点
 			if err := m.saveCheckpoint(table.Name, lastID, primaryKey, true); err != nil {
 				logrus.Warnf(i18n.Tr("保存最终断点失败: %v", "Failed to save final checkpoint: %v"), err)
@@ -438,21 +481,16 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 			break
 		}
 
-		// 应用全局限速
-		if err := migration.EnforceGlobalRateLimit(ctx, rowCount); err != nil {
-			return err
-		}
-
-		// 检查是否需要停止
+		// Check if we need to stop
 		select {
 		case <-ctx.Done():
-			// 在中断时保存断点
+			// Save checkpoint on interrupt
 			if err := m.saveCheckpoint(table.Name, lastID, primaryKey, false); err != nil {
 				logrus.Warnf(i18n.Tr("中断时保存断点失败: %v", "Failed to save checkpoint on interrupt: %v"), err)
 			}
 			return ctx.Err()
 		default:
-			// 继续处理
+			// Continue processing
 		}
 	}
 
@@ -583,12 +621,6 @@ func (m *MySQLMigration) executeBatchInsert(ctx context.Context, query string, v
 }
 
 // 辅助函数
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
 
 // 添加断点相关方法
 func (m *MySQLMigration) loadCheckpoint(tableName string) (*migration.Checkpoint, error) {
@@ -658,142 +690,6 @@ func (m *MySQLMigration) saveCheckpoint(tableName string, lastID int64, primaryK
 	}
 
 	return nil
-}
-
-func (m *MySQLMigration) processBatch(tableName string, columns []string, primaryKey string, lastID int64, batchSize int, table config.TableMapping) ([]interface{}, int, int64, error) {
-	// 准备扫描目标
-	values := make([]interface{}, len(columns))
-	scanArgs := make([]interface{}, len(columns))
-	for i := range values {
-		scanArgs[i] = &sql.RawBytes{}
-	}
-
-	// 构建查询语句
-	var query string
-	if table.Where != "" {
-		// 使用自定义 WHERE 条件
-		if len(table.ColumnTransformations) > 0 {
-			transformedColumns := make([]string, 0)
-			for _, col := range columns {
-				// 检查是否有此列的转换
-				transformed := false
-				for _, transform := range table.ColumnTransformations {
-					if transform.SourceColumn == col {
-						// 应用转换表达式
-						transformedColumns = append(transformedColumns, fmt.Sprintf("%s AS %s", transform.Expression, col))
-						transformed = true
-						break
-					}
-				}
-				// 如果没有转换，使用原始列名
-				if !transformed {
-					transformedColumns = append(transformedColumns, col)
-				}
-			}
-			query = fmt.Sprintf("SELECT %s FROM %s WHERE %s",
-				strings.Join(transformedColumns, ", "),
-				tableName,
-				table.Where)
-		} else {
-			query = fmt.Sprintf("SELECT %s FROM %s WHERE %s",
-				strings.Join(columns, ", "),
-				tableName,
-				table.Where)
-		}
-	} else if primaryKey != "" {
-		// 使用主键作为条件
-		if len(table.ColumnTransformations) > 0 {
-			transformedColumns := make([]string, 0)
-			for _, col := range columns {
-				transformed := false
-				for _, transform := range table.ColumnTransformations {
-					if transform.SourceColumn == col {
-						// 应用转换表达式
-						transformedColumns = append(transformedColumns, fmt.Sprintf("%s AS %s", transform.Expression, col))
-						transformed = true
-						break
-					}
-				}
-				if !transformed {
-					transformedColumns = append(transformedColumns, col)
-				}
-			}
-			query = fmt.Sprintf("SELECT %s FROM %s WHERE %s > ? ORDER BY %s LIMIT ?",
-				strings.Join(transformedColumns, ", "),
-				tableName,
-				primaryKey,
-				primaryKey)
-		} else {
-			// 没有列转换，使用简单查询
-			query = fmt.Sprintf("SELECT %s FROM %s WHERE %s > ? ORDER BY %s LIMIT ?",
-				strings.Join(columns, ", "),
-				tableName,
-				primaryKey,
-				primaryKey)
-		}
-	} else {
-		return nil, 0, 0, fmt.Errorf(i18n.Tr("未指定 WHERE 条件且无法获取主键",
-			"No WHERE condition specified and unable to get primary key"))
-	}
-
-	// 执行查询
-	var rows *sql.Rows
-	var err error
-	if table.Where != "" {
-		rows, err = m.source.Query(query)
-		logrus.Debugf(i18n.Tr("使用自定义 WHERE 条件执行查询", "Executing query with custom WHERE condition"))
-	} else {
-		rows, err = m.source.Query(query, lastID, batchSize)
-		logrus.Debugf(i18n.Tr("使用主键条件执行查询，lastID: %d, batchSize: %d",
-			"Executing query with primary key condition, lastID: %d, batchSize: %d"), lastID, batchSize)
-	}
-	if err != nil {
-		return nil, 0, 0, fmt.Errorf("查询数据失败: %v", err)
-	}
-	defer rows.Close()
-
-	count := 0
-	maxID := int64(0)
-	batch := make([]interface{}, 0, batchSize*len(columns))
-
-	// 遍历结果集
-	for rows.Next() {
-		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, 0, 0, fmt.Errorf(i18n.Tr("扫描行失败: %v", "Failed to scan row: %v"), err)
-		}
-
-		// 处理每一列的值
-		for i := range columns {
-			rb := scanArgs[i].(*sql.RawBytes)
-			if rb == nil || len(*rb) == 0 {
-				values[i] = nil
-			} else {
-				// 对于主键列，特殊处理
-				if i == 0 {
-					id, err := strconv.ParseInt(string(*rb), 10, 64)
-					if err != nil {
-						return nil, 0, 0, fmt.Errorf(i18n.Tr("解析主键 %s 失败: %v", "Failed to parse primary key %s: %v"), primaryKey, err)
-					}
-					values[i] = id
-					if id > maxID {
-						maxID = id
-					}
-				} else {
-					values[i] = string(*rb)
-				}
-			}
-		}
-
-		// 添加到批处理
-		batch = append(batch, values...)
-		count++
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, 0, 0, fmt.Errorf(i18n.Tr("遍历行时发生错误: %v", "Failed to iterate rows: %v"), err)
-	}
-
-	return batch, count, maxID, nil
 }
 
 func (m *MySQLMigration) getPrimaryKey(tableName string) (string, error) {

@@ -227,12 +227,13 @@ var (
 )
 
 // InitGlobalLimiter 初始化全局限速器
-func InitGlobalLimiter(rateLimit int) {
+// InitGlobalLimiter 初始化全局限速器
+func InitGlobalLimiter(rateLimit int, batchSize int) {
 	globalRateMutex.Lock()
 	defer globalRateMutex.Unlock()
 
 	if rateLimit > 0 {
-		// burst 设为速率的 1/10，最小 100，最大 1000
+		// burst 设为速率的 1/10，最小 100，最大 1000，但必须至少为 batchSize
 		// 这样可以允许短暂突发但保持整体速率稳定
 		burst := rateLimit / 10
 		if burst < 100 {
@@ -241,6 +242,12 @@ func InitGlobalLimiter(rateLimit int) {
 		if burst > 1000 {
 			burst = 1000
 		}
+
+		// 确保 burst 至少能够容纳一个批次
+		if burst < batchSize {
+			burst = batchSize
+		}
+
 		globalRateLimiter = rate.NewLimiter(rate.Limit(rateLimit), burst)
 	} else {
 		globalRateLimiter = nil

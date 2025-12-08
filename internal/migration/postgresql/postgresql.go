@@ -131,7 +131,7 @@ func NewMigration(config *config.Config) (migration.Migration, error) {
 	}
 
 	// 初始化全局限速器
-	migration.InitGlobalLimiter(config.Migration.RateLimit)
+	migration.InitGlobalLimiter(config.Migration.RateLimit, config.Migration.BatchSize)
 
 	logrus.Info(i18n.Tr("数据库连接成功", "Database connection successful"))
 	return &PostgreSQLMigration{
@@ -177,6 +177,11 @@ func (m *PostgreSQLMigration) Run(ctx context.Context) error {
 	}
 	semaphore := make(chan struct{}, workers)
 	logrus.Infof(i18n.Tr("使用 %d 个工作线程进行并发迁移", "Using %d worker threads for concurrent migration"), workers)
+
+	// 输出全局配置信息
+	logrus.Infof(i18n.Tr("全局配置: 批次大小=%d, 限速=%d 行/秒",
+		"Global Config: Batch Size=%d, Rate Limit=%d rows/sec"),
+		m.config.Migration.BatchSize, m.config.Migration.RateLimit)
 
 	// 验证所有表的转换表达式
 	for _, table := range m.config.Source.Tables {
@@ -290,6 +295,9 @@ func (m *PostgreSQLMigration) migrateTable(ctx context.Context, table config.Tab
 
 	// 获取总行数
 	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s", table.Name)
+	if table.Where != "" {
+		countQuery = fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", table.Name, table.Where)
+	}
 	if err := m.source.QueryRow(countQuery).Scan(&totalRows); err != nil {
 		return fmt.Errorf(i18n.Tr("获取总行数失败: %v", "Failed to get total row count: %v"), err)
 	}
@@ -312,6 +320,9 @@ func (m *PostgreSQLMigration) migrateTable(ctx context.Context, table config.Tab
 	if lastID > 0 {
 		var completedRows int64
 		completedQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s <= $1", table.Name, primaryKey)
+		if table.Where != "" {
+			completedQuery = fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE (%s) AND %s <= $1", table.Name, table.Where, primaryKey)
+		}
 		if err := m.source.QueryRow(completedQuery, lastID).Scan(&completedRows); err != nil {
 			return fmt.Errorf(i18n.Tr("获取已完成行数失败: %v", "Failed to get completed row count: %v"), err)
 		}
@@ -337,10 +348,7 @@ func (m *PostgreSQLMigration) migrateTable(ctx context.Context, table config.Tab
 	}
 
 	logrus.Infof(i18n.Tr("总行数: %d (从 %s=%d 开始)", "Total rows: %d (starting from %s=%d)"), totalRows, primaryKey, lastID)
-	// 输出全局配置信息
-	logrus.Infof(i18n.Tr("开始执行数据查询，批次大小: %d, 全局限速: %d 行/秒",
-		"Starting data query, batch size: %d, global rate limit: %d rows/sec"),
-		m.config.Migration.BatchSize, m.config.Migration.RateLimit)
+
 	// 确定目标表名
 	targetName := table.Name
 	if table.TargetName != "" {
@@ -377,6 +385,10 @@ func (m *PostgreSQLMigration) migrateTable(ctx context.Context, table config.Tab
 		// 查询数据
 		selectQuery := fmt.Sprintf("SELECT %s FROM %s WHERE %s > $1 ORDER BY %s LIMIT $2",
 			strings.Join(selectColumns, ", "), table.Name, primaryKey, primaryKey)
+		if table.Where != "" {
+			selectQuery = fmt.Sprintf("SELECT %s FROM %s WHERE (%s) AND %s > $1 ORDER BY %s LIMIT $2",
+				strings.Join(selectColumns, ", "), table.Name, table.Where, primaryKey, primaryKey)
+		}
 		rows, err := m.source.Query(selectQuery, lastID, batchSize)
 		if err != nil {
 			return fmt.Errorf(i18n.Tr("查询数据失败: %v", "Failed to query data: %v"), err)

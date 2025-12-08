@@ -153,7 +153,7 @@ func NewMigration(config *config.Config) (migration.Migration, error) {
 	}
 
 	// 初始化全局限速器
-	migration.InitGlobalLimiter(config.Migration.RateLimit)
+	migration.InitGlobalLimiter(config.Migration.RateLimit, config.Migration.BatchSize)
 
 	return &CassandraMigration{
 		source:             sourceSession,
