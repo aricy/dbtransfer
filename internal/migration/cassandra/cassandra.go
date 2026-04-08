@@ -881,6 +881,7 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 		}
 
 		// 如果需要TTL，添加TTL值
+		skipRow := false
 		if ttlCount > 0 {
 			for i := range columns {
 				colType := columnTypes[columns[i].Name]
@@ -892,15 +893,22 @@ func (m *CassandraMigration) copyData(ctx context.Context, sourceName, targetNam
 					ttlVal := *(ttlValues[i].(*int))
 					// Apply TTL modification if needed
 					if ttlMode == "modify" {
-						ttlVal += ttlValue
-						if ttlVal < 0 {
-							ttlVal = 0 // Ensure TTL is not negative
+						if ttlVal > 0 {
+							ttlVal += ttlValue
+							if ttlVal <= 0 {
+								skipRow = true
+								break
+							}
 						}
 					}
 					dataValues[len(dataValues)-1] = ttlVal
 					break
 				}
 			}
+		}
+
+		if skipRow {
+			continue
 		}
 
 		// 更新当前键
