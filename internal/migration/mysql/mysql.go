@@ -273,11 +273,11 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 			}
 			if err := m.source.QueryRow(completedQuery, lastID).Scan(&completedRows); err == nil {
 				totalRows -= completedRows
-				logrus.Infof("从断点恢复，已完成 %d 行，剩余 %d 行", completedRows, totalRows)
+				logrus.Infof(i18n.Tr("从断点恢复，已完成 %d 行，剩余 %d 行", "Resuming from checkpoint, completed %d rows, remaining %d rows"), completedRows, totalRows)
 			}
 		}
 		stats.TotalRows = totalRows
-		logrus.Infof("表 %s 估算剩余行数: %d", table.Name, totalRows)
+		logrus.Infof(i18n.Tr("表 %s 估算剩余行数: %d", "Table %s estimated remaining rows: %d"), table.Name, totalRows)
 	}
 
 	// 构建查询语句
@@ -414,7 +414,7 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 				"Executing query with primary key condition, lastID: %d, batchSize: %d"), lastID, batchSize)
 		}
 		if err != nil {
-			return fmt.Errorf("查询数据失败: %v", err)
+			return fmt.Errorf(i18n.Tr("查询数据失败: %v", "Failed to query data: %v"), err)
 		}
 		defer rows.Close()
 
@@ -433,7 +433,7 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 			hasData = true
 			// 扫描行数据
 			if err := rows.Scan(scanArgs...); err != nil {
-				return fmt.Errorf("扫描行数据失败: %v", err)
+				return fmt.Errorf(i18n.Tr("扫描行数据失败: %v", "Failed to scan row data: %v"), err)
 			}
 
 			// 添加到批次
@@ -552,7 +552,7 @@ func (m *MySQLMigration) getTableSchema(tableName string) (string, error) {
 	rows := m.source.QueryRow(query)
 	var tableName2 string
 	if err := rows.Scan(&tableName2, &tableCreate); err != nil {
-		return "", fmt.Errorf("获取表结构失败: %v", err)
+		return "", fmt.Errorf(i18n.Tr("获取表结构失败: %v", "Failed to get table schema: %v"), err)
 	}
 	return tableCreate, nil
 }
@@ -561,7 +561,7 @@ func (m *MySQLMigration) executeBatchWithRetry(ctx context.Context, tableName st
 	// 获取列信息
 	columns, err := m.getColumns(tableName)
 	if err != nil {
-		return fmt.Errorf("获取列信息失败: %v", err)
+		return fmt.Errorf(i18n.Tr("获取列信息失败: %v", "Failed to get column information: %v"), err)
 	}
 
 	// 构建基本的插入语句
@@ -591,7 +591,7 @@ func (m *MySQLMigration) executeBatchWithRetry(ctx context.Context, tableName st
 func (m *MySQLMigration) executeBatchInsert(ctx context.Context, query string, values []interface{}, colCount int) error {
 	for i := 0; i < m.maxRetries; i++ {
 		// 打印原始查询
-		logrus.Debugf("原始查询: %s", query)
+		logrus.Debugf(i18n.Tr("原始查询: %s", "Original query: %s"), query)
 
 		// 准备批量插入的参数
 		batchCount := len(values) / colCount
@@ -622,22 +622,23 @@ func (m *MySQLMigration) executeBatchInsert(ctx context.Context, query string, v
 		}
 
 		// 打印调试信息
-		logrus.Debugf("最终SQL: %s", stmt)
-		logrus.Debugf("值数量: %d, 列数: %d, 批次数: %d", len(valueArgs), colCount, batchCount)
+		logrus.Debugf(i18n.Tr("最终SQL: %s", "Final SQL: %s"), stmt)
+		logrus.Debugf(i18n.Tr("值数量: %d, 列数: %d, 批次数: %d", "Value count: %d, column count: %d, batch count: %d"), len(valueArgs), colCount, batchCount)
 
 		// 执行插入
 		if _, err := m.dest.Exec(stmt, valueArgs...); err != nil {
 			if i == m.maxRetries-1 {
-				return fmt.Errorf("执行批量插入失败: %v\nSQL: %s\n值数量: %d, 列数: %d, 批次数: %d",
+				return fmt.Errorf(i18n.Tr("执行批量插入失败: %v\nSQL: %s\n值数量: %d, 列数: %d, 批次数: %d",
+					"Batch insert failed: %v\nSQL: %s\nValue count: %d, column count: %d, batch count: %d"),
 					err, stmt, len(valueArgs), colCount, batchCount)
 			}
-			logrus.Warnf("插入失败，准备重试: %v", err)
+			logrus.Warnf(i18n.Tr("插入失败，准备重试: %v", "Insert failed, preparing to retry: %v"), err)
 			time.Sleep(m.retryDelay)
 			continue
 		}
 		return nil
 	}
-	return fmt.Errorf("达到最大重试次数")
+	return fmt.Errorf(i18n.Tr("达到最大重试次数", "Max retries reached"))
 }
 
 // 辅助函数

@@ -237,7 +237,7 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, collection con
 		delete(m.statsMap, collection.Name)
 		if lastID != "" && !completed {
 			if err := m.saveCheckpoint(collection.Name, map[string]string{"_id": lastID}, false); err != nil {
-				logrus.Warnf("退出时保存断点失败: %v", err)
+				logrus.Warnf(i18n.Tr("退出时保存断点失败: %v", "Failed to save checkpoint on exit: %v"), err)
 			}
 		}
 	}()

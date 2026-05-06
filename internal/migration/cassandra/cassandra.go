@@ -188,22 +188,22 @@ func (m *CassandraMigration) Run(ctx context.Context) error {
 		// 获取预估总分区数
 		totalRows, _, err := m.estimator.EstimateTotalRows(m.config.Source.Keyspace, table.Name)
 		if err != nil {
-			logrus.Warnf("预估总分区数失败: %v", err)
+			logrus.Warnf(i18n.Tr("预估总分区数失败: %v", "Failed to estimate total partitions: %v"), err)
 		} else {
-			logrus.Infof("表 %s 来自 system.size_estimates 的总分区数: %d", table.Name, totalRows)
+			logrus.Infof(i18n.Tr("表 %s 来自 system.size_estimates 的总分区数: %d", "Table %s total partitions from system.size_estimates: %d"), table.Name, totalRows)
 		}
 
 		avgPartSize := m.estimator.GetAvgPartitionSize()
 		rowsPerPart := 1.0
 		hasClustering, err := m.hasClusteringKeys(m.config.Source.Keyspace, table.Name)
 		if err != nil {
-			logrus.Warnf("检测 clustering key 失败: %v, 默认 rowsPerPart=1", err)
+			logrus.Warnf(i18n.Tr("检测 clustering key 失败: %v, 默认 rowsPerPart=1", "Failed to detect clustering keys: %v, defaulting rowsPerPart=1"), err)
 		}
 		if hasClustering {
 			if avgPartSize > 0 {
 				avgRowSize, err := m.sampleAvgRowSize(m.config.Source.Keyspace, table.Name)
 				if err != nil {
-					logrus.Warnf("采样行大小失败: %v, 使用默认估算 100 bytes/行", err)
+					logrus.Warnf(i18n.Tr("采样行大小失败: %v, 使用默认估算 100 bytes/行", "Failed to sample row size: %v, using default estimate 100 bytes/row"), err)
 					avgRowSize = 100
 				}
 				rowsPerPart = float64(avgPartSize) / float64(avgRowSize)
@@ -211,9 +211,9 @@ func (m *CassandraMigration) Run(ctx context.Context) error {
 					rowsPerPart = 1.0
 				}
 			}
-			logrus.Infof("表 %s 存在 clustering key, 估算每分区 %.1f 行 (平均分区大小: %d bytes, 采样行大小: %.0f bytes)", table.Name, rowsPerPart, avgPartSize, float64(avgPartSize)/rowsPerPart)
+			logrus.Infof(i18n.Tr("表 %s 存在 clustering key, 估算每分区 %.1f 行 (平均分区大小: %d bytes, 采样行大小: %.0f bytes)", "Table %s has clustering keys, estimated %.1f rows/partition (avg partition size: %d bytes, sampled row size: %.0f bytes)"), table.Name, rowsPerPart, avgPartSize, float64(avgPartSize)/rowsPerPart)
 		} else {
-			logrus.Infof("表 %s 无 clustering key, 分区数=行数", table.Name)
+			logrus.Infof(i18n.Tr("表 %s 无 clustering key, 分区数=行数", "Table %s has no clustering keys, partitions=rows"), table.Name)
 		}
 
 		// 估算总行数
@@ -476,7 +476,7 @@ func (m *CassandraMigration) adjustTotalByRemainingRanges(tableName string, rang
 	stats.Lock()
 	stats.TotalRows = int64(adjusted)
 	stats.Unlock()
-	logrus.Infof("按剩余范围调整估算: %d/%d 范围, 调整后估算行数: %d", remainingRanges, totalRanges, int64(adjusted))
+	logrus.Infof(i18n.Tr("按剩余范围调整估算: %d/%d 范围, 调整后估算行数: %d", "Adjusted estimate by remaining ranges: %d/%d ranges, adjusted estimated rows: %d"), remainingRanges, totalRanges, int64(adjusted))
 }
 
 func (m *CassandraMigration) migrateDependencies() error {

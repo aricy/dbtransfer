@@ -139,7 +139,7 @@ func (s *MigrationStats) Report() {
 // formatRemainingTimeFromRate calculates remaining time from remaining rows and current rate.
 func formatRemainingTimeFromRate(remainingRows int64, rate float64) string {
 	if rate <= 0 || remainingRows <= 0 {
-		return "计算中..."
+		return i18n.Tr("计算中...", "Calculating...")
 	}
 	seconds := float64(remainingRows) / rate
 	d := time.Duration(seconds) * time.Second
@@ -150,15 +150,15 @@ func formatRemainingTimeFromRate(remainingRows int64, rate float64) string {
 	secs := int(d.Seconds()) % 60
 
 	if days > 0 {
-		return fmt.Sprintf("%d天%d小时%d分钟", days, hours, minutes)
+		return fmt.Sprintf(i18n.Tr("%d天%d小时%d分钟", "%dd %dh %dm"), days, hours, minutes)
 	}
 	if hours > 0 {
-		return fmt.Sprintf("%d小时%d分钟%d秒", hours, minutes, secs)
+		return fmt.Sprintf(i18n.Tr("%d小时%d分钟%d秒", "%dh %dm %ds"), hours, minutes, secs)
 	}
 	if minutes > 0 {
-		return fmt.Sprintf("%d分钟%d秒", minutes, secs)
+		return fmt.Sprintf(i18n.Tr("%d分钟%d秒", "%dm %ds"), minutes, secs)
 	}
-	return fmt.Sprintf("%d秒", secs)
+	return fmt.Sprintf(i18n.Tr("%d秒", "%ds"), secs)
 }
 
 // 确保目录存在

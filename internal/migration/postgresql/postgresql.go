@@ -152,12 +152,12 @@ func (m *PostgreSQLMigration) Close() error {
 	var errs []string
 	if m.source != nil {
 		if err := m.source.Close(); err != nil {
-			errs = append(errs, fmt.Sprintf("关闭源数据库连接失败: %v", err))
+			errs = append(errs, fmt.Sprintf(i18n.Tr("关闭源数据库连接失败: %v", "Failed to close source database connection: %v"), err))
 		}
 	}
 	if m.dest != nil {
 		if err := m.dest.Close(); err != nil {
-			errs = append(errs, fmt.Sprintf("关闭目标数据库连接失败: %v", err))
+			errs = append(errs, fmt.Sprintf(i18n.Tr("关闭目标数据库连接失败: %v", "Failed to close destination database connection: %v"), err))
 		}
 	}
 	if len(errs) > 0 {
@@ -189,7 +189,7 @@ func (m *PostgreSQLMigration) Run(ctx context.Context) error {
 			if err := validateTransformExpression(transform.Expression); err != nil {
 				return fmt.Errorf(i18n.Tr(
 					"表 %s 的列 %s 转换表达式无效: %v",
-					"Invalid transform expression for column %s in table %s: %v"),
+					"Invalid transform expression for table %s, column %s: %v"),
 					table.Name, transform.SourceColumn, err)
 			}
 		}
@@ -297,10 +297,10 @@ func (m *PostgreSQLMigration) migrateTable(ctx context.Context, table config.Tab
 	var estimateErr error
 	totalRows, estimateErr = m.estimateTableRows(table.Name)
 	if estimateErr != nil {
-		logrus.Warnf("统计信息估算失败: %v, 回退到 COUNT(*)", estimateErr)
+		logrus.Warnf(i18n.Tr("统计信息估算失败: %v, 回退到 COUNT(*)", "Statistics estimation failed: %v, falling back to COUNT(*)"), estimateErr)
 		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s", table.Name)
 		if err := m.source.QueryRow(countQuery).Scan(&totalRows); err != nil {
-			logrus.Warnf("COUNT(*) 也失败: %v, 不显示进度百分比", err)
+			logrus.Warnf(i18n.Tr("COUNT(*) 也失败: %v, 不显示进度百分比", "COUNT(*) also failed: %v, progress percentage unavailable"), err)
 			totalRows = 0
 		}
 	}
@@ -308,7 +308,7 @@ func (m *PostgreSQLMigration) migrateTable(ctx context.Context, table config.Tab
 		// 有自定义 WHERE 条件时无法从统计信息估算，使用 COUNT(*) 获取精确值
 		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", table.Name, table.Where)
 		if err := m.source.QueryRow(countQuery).Scan(&totalRows); err != nil {
-			logrus.Warnf("获取过滤后总行数失败: %v, 不显示进度百分比", err)
+			logrus.Warnf(i18n.Tr("获取过滤后总行数失败: %v, 不显示进度百分比", "Failed to get filtered row count: %v, progress percentage unavailable"), err)
 			totalRows = 0
 		}
 	}
@@ -512,7 +512,7 @@ func (m *PostgreSQLMigration) getTableSchema(tableName string) (string, error) {
 	`
 
 	if err := m.source.QueryRow(query, tableName).Scan(&tableSchema); err != nil {
-		return "", fmt.Errorf("获取表结构失败: %v", err)
+		return "", fmt.Errorf(i18n.Tr("获取表结构失败: %v", "Failed to get table schema: %v"), err)
 	}
 
 	return tableSchema, nil
