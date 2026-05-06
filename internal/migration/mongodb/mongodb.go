@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -107,8 +108,10 @@ func connectMongoDB(ctx context.Context, config config.DBConfig, clientOptions *
 	// 构建连接字符串
 	var uri string
 	if config.Username != "" && config.Password != "" {
-		// 添加认证数据库，默认为 admin
-		authDB := "admin"
+		authDB := config.Database
+		if authDB == "" {
+			authDB = "admin"
+		}
 		if config.AuthDB != "" {
 			authDB = config.AuthDB
 		}
@@ -227,9 +230,16 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, collection con
 
 	// 启动进度报告
 	stats.StartReporting(time.Duration(m.config.Migration.ProgressInterval) * time.Second)
+	var lastID string
+	var completed bool
 	defer func() {
 		stats.StopReporting()
-		delete(m.statsMap, collection.Name) // 清理统计信息
+		delete(m.statsMap, collection.Name)
+		if lastID != "" && !completed {
+			if err := m.saveCheckpoint(collection.Name, map[string]string{"_id": lastID}, false); err != nil {
+				logrus.Warnf("退出时保存断点失败: %v", err)
+			}
+		}
 	}()
 
 	// 检查断点
@@ -250,8 +260,13 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, collection con
 		logrus.Infof(i18n.Tr("使用自定义过滤条件: %s", "Using custom filter: %s"), collection.Where)
 	}
 
-	// 获取总文档数
-	totalDocs, err := sourceDB.Collection(collection.Name).CountDocuments(ctx, baseFilter)
+	// 获取总文档数（无过滤条件时用元数据估算，O(1) 毫秒级；有过滤条件时回退到 CountDocuments）
+	var totalDocs int64
+	if len(baseFilter) == 0 {
+		totalDocs, err = sourceDB.Collection(collection.Name).EstimatedDocumentCount(ctx)
+	} else {
+		totalDocs, err = sourceDB.Collection(collection.Name).CountDocuments(ctx, baseFilter)
+	}
 	if err != nil {
 		return fmt.Errorf(i18n.Tr("获取集合总文档数失败: %v", "Failed to get collection document count: %v"), err)
 	}
@@ -271,41 +286,76 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, collection con
 
 	// 如果有断点，计算已完成的文档数
 	if checkpoint != nil && len(checkpoint.LastKey) > 0 {
-		if lastID, ok := checkpoint.LastKey["_id"]; ok {
-			objID, err := primitive.ObjectIDFromHex(lastID)
-			if err == nil {
-				// 组合过滤条件
-				if len(baseFilter) > 0 {
-					filter = bson.M{"$and": []bson.M{baseFilter, {"_id": bson.M{"$gt": objID}}}}
+		if idStr, ok := checkpoint.LastKey["_id"]; ok && idStr != "" {
+			lastID = idStr
+			// 根据类型前缀还原 _id 值
+			var idValue interface{}
+			switch {
+			case strings.HasPrefix(idStr, "o:"):
+				if objID, err := primitive.ObjectIDFromHex(idStr[2:]); err == nil {
+					idValue = objID
 				} else {
-					filter = bson.M{"_id": bson.M{"$gt": objID}}
+					idValue = idStr
 				}
-
-				// 获取从断点位置开始的剩余文档数
-				remainingDocs, err = sourceDB.Collection(collection.Name).CountDocuments(ctx, filter)
-				if err != nil {
-					return fmt.Errorf(i18n.Tr("获取剩余文档数失败: %v", "Failed to get remaining document count: %v"), err)
+			case strings.HasPrefix(idStr, "s:"):
+				idValue = idStr[2:]
+			case strings.HasPrefix(idStr, "i:"):
+				if v, err := strconv.ParseInt(idStr[2:], 10, 32); err == nil {
+					idValue = int32(v)
+				} else {
+					idValue = idStr
 				}
-
-				// 计算已处理的文档数
-				completedDocs := totalDocs - remainingDocs
-
-				// 设置起始进度
-				stats.ProcessedRows = 0         // 从0开始计数
-				stats.TotalRows = remainingDocs // 设置为剩余行数
-
-				logrus.Infof(i18n.Tr("从断点继续，已完成 %d 行，剩余 %d 行",
-					"Continuing from checkpoint, completed %d rows, remaining %d rows"),
-					completedDocs, remainingDocs)
-				logrus.Infof(i18n.Tr("从断点继续，上次处理到 %s=%s",
-					"Continuing from checkpoint, last processed %s=%s"),
-					primaryKey, lastID)
-
-				// 重置统计信息
-				stats.ResetStartTime(true)
+			case strings.HasPrefix(idStr, "l:"):
+				if v, err := strconv.ParseInt(idStr[2:], 10, 64); err == nil {
+					idValue = v
+				} else {
+					idValue = idStr
+				}
+			case strings.HasPrefix(idStr, "f:"):
+				if v, err := strconv.ParseFloat(idStr[2:], 64); err == nil {
+					idValue = v
+				} else {
+					idValue = idStr
+				}
+			default:
+				// 兼容旧格式：尝试 ObjectID hex，否则作为字符串
+				if objID, err := primitive.ObjectIDFromHex(idStr); err == nil {
+					idValue = objID
+				} else {
+					idValue = idStr
+				}
 			}
+			// 组合过滤条件
+			if len(baseFilter) > 0 {
+				filter = bson.M{"$and": []bson.M{baseFilter, {"_id": bson.M{"$gt": idValue}}}}
+			} else {
+				filter = bson.M{"_id": bson.M{"$gt": idValue}}
+			}
+
+			// 获取从断点位置开始的剩余文档数
+			remainingDocs, err = sourceDB.Collection(collection.Name).CountDocuments(ctx, filter)
+			if err != nil {
+				return fmt.Errorf(i18n.Tr("获取剩余文档数失败: %v", "Failed to get remaining document count: %v"), err)
+			}
+
+			// 计算已处理的文档数
+			completedDocs := totalDocs - remainingDocs
+
+			// 设置起始进度
+			stats.ProcessedRows = 0         // 从0开始计数
+			stats.TotalRows = remainingDocs // 设置为剩余行数
+
+			logrus.Infof(i18n.Tr("从断点继续，已完成 %d 行，剩余 %d 行",
+				"Continuing from checkpoint, completed %d rows, remaining %d rows"),
+				completedDocs, remainingDocs)
+			logrus.Infof(i18n.Tr("从断点继续，上次处理到 %s=%s",
+				"Continuing from checkpoint, last processed %s=%s"),
+				primaryKey, lastID)
+
+			// 重置统计信息
+			stats.ResetStartTime(true)
 		}
-	} else {
+		} else {
 		// 从头开始迁移
 		stats.ProcessedRows = 0
 		remainingDocs = totalDocs
@@ -335,7 +385,6 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, collection con
 
 	// 批量处理数据
 	batch := make([]interface{}, 0, batchSize)
-	var lastID string
 
 	for cursor.Next(ctx) {
 		var doc bson.M
@@ -344,8 +393,20 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, collection con
 		}
 
 		batch = append(batch, doc)
-		if id, ok := doc["_id"].(primitive.ObjectID); ok {
-			lastID = id.Hex()
+		// 将 _id 编码为带类型前缀的字符串
+		switch id := doc["_id"].(type) {
+		case primitive.ObjectID:
+			lastID = "o:" + id.Hex()
+		case string:
+			lastID = "s:" + id
+		case int32:
+			lastID = fmt.Sprintf("i:%d", id)
+		case int64:
+			lastID = fmt.Sprintf("l:%d", id)
+		case float64:
+			lastID = fmt.Sprintf("f:%v", id)
+		default:
+			lastID = fmt.Sprintf("v:%v", id)
 		}
 
 		// 当批次达到指定大小时，执行插入
@@ -373,6 +434,14 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, collection con
 		}
 	}
 
+	// 检查游标错误和上下文取消
+	if err := cursor.Err(); err != nil {
+		return fmt.Errorf(i18n.Tr("游标遍历出错: %v", "Cursor iteration error: %v"), err)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf(i18n.Tr("迁移被中断: %v", "Migration interrupted: %v"), err)
+	}
+
 	// 处理最后一批数据
 	if len(batch) > 0 {
 		if err := m.insertBatch(ctx, destColl, batch); err != nil {
@@ -391,11 +460,12 @@ func (m *MongoDBMigration) migrateCollection(ctx context.Context, collection con
 	}
 
 	// 保存完成标记
+	completed = true
 	if err := m.saveCheckpoint(collection.Name, map[string]string{"_id": lastID}, true); err != nil {
 		logrus.Warnf(i18n.Tr("保存完成标记失败: %v", "Failed to save completion marker: %v"), err)
 	}
 
-	logrus.Infof(i18n.Tr("集合 %s 迁移完成，共迁移 %d 文档", "Collection %s migration completed, migrated %d documents"), collection.Name, totalDocs)
+	logrus.Infof(i18n.Tr("集合 %s 迁移完成，共迁移 %d 文档", "Collection %s migration completed, migrated %d documents"), collection.Name, stats.ProcessedRows)
 
 	return nil
 }

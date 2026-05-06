@@ -4,11 +4,12 @@ go 1.21
 
 require (
 	github.com/go-sql-driver/mysql v1.7.1
-	github.com/gocql/gocql v1.6.0
+	github.com/gocql/gocql v1.7.0
 	github.com/lib/pq v1.10.9
 	github.com/sirupsen/logrus v1.9.3
 	go.mongodb.org/mongo-driver v1.13.1
 	golang.org/x/time v0.5.0
+	gopkg.in/inf.v0 v0.9.1
 	gopkg.in/yaml.v2 v2.4.0
 )
 
@@ -25,5 +26,4 @@ require (
 	golang.org/x/sync v0.8.0 // indirect
 	golang.org/x/sys v0.23.0 // indirect
 	golang.org/x/text v0.17.0 // indirect
-	gopkg.in/inf.v0 v0.9.1 // indirect
 )

@@ -314,7 +314,7 @@ func main() {
 		logrus.Fatalf(i18n.Tr("迁移失败: %v", "Migration failed: %v"), err)
 	}
 	duration := time.Since(startTime)
-	logrus.Infof(i18n.Tr("迁移完成，总耗时: %v", "Migration completed, total time: %v"), duration)
+	logrus.Infof(i18n.Tr("迁移完成，总耗时: %v", "Migration completed, total time: %v"), duration.Round(time.Second))
 }
 
 func setupLogging() {

@@ -121,18 +121,44 @@ func (s *MigrationStats) Report() {
 		// 计算已处理的百分比
 		percentage = float64(s.ProcessedRows) / float64(s.TotalRows) * 100
 
-		// 计算剩余行数
+		// 计算剩余行数和预计剩余时间
 		remainingRows := s.TotalRows - s.ProcessedRows
+		remainingStr := formatRemainingTimeFromRate(remainingRows, rate)
 
-		logrus.Infof(i18n.Tr("[%s] 进度: %d/%d 行 (%.2f%%), 剩余: %d 行, 速率: %.2f 行/秒, 已用时间: %v",
-			"[%s] Progress: %d/%d rows (%.2f%%), Remaining: %d rows, Rate: %.2f rows/sec, Elapsed time: %v"),
-			s.tableName, s.ProcessedRows, s.TotalRows, percentage, remainingRows, rate, duration.Round(time.Second))
+		logrus.Infof(i18n.Tr("[%s] 进度: %d/%d 行 (%.2f%%), 剩余: %d 行, 速率: %.0f 行/秒, 已用时间: %v, 预计剩余: %s",
+			"[%s] Progress: %d/%d rows (%.2f%%), Remaining: %d rows, Rate: %.0f rows/sec, Elapsed time: %v, Remaining: %s"),
+			s.tableName, s.ProcessedRows, s.TotalRows, percentage, remainingRows, rate, duration.Round(time.Second), remainingStr)
 	} else {
 		// 对于不提供总行数的数据库，显示已处理行数和速率
-		logrus.Infof(i18n.Tr("[%s] 已处理: %d 行, 速率: %.2f 行/秒, 已用时间: %v",
-			"[%s] Processed: %d rows, Rate: %.2f rows/sec, Elapsed time: %v"),
+		logrus.Infof(i18n.Tr("[%s] 已处理: %d 行, 速率: %.0f 行/秒, 已用时间: %v",
+			"[%s] Processed: %d rows, Rate: %.0f rows/sec, Elapsed time: %v"),
 			s.tableName, s.ProcessedRows, rate, duration.Round(time.Second))
 	}
+}
+
+// formatRemainingTimeFromRate calculates remaining time from remaining rows and current rate.
+func formatRemainingTimeFromRate(remainingRows int64, rate float64) string {
+	if rate <= 0 || remainingRows <= 0 {
+		return "计算中..."
+	}
+	seconds := float64(remainingRows) / rate
+	d := time.Duration(seconds) * time.Second
+
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	minutes := int(d.Minutes()) % 60
+	secs := int(d.Seconds()) % 60
+
+	if days > 0 {
+		return fmt.Sprintf("%d天%d小时%d分钟", days, hours, minutes)
+	}
+	if hours > 0 {
+		return fmt.Sprintf("%d小时%d分钟%d秒", hours, minutes, secs)
+	}
+	if minutes > 0 {
+		return fmt.Sprintf("%d分钟%d秒", minutes, secs)
+	}
+	return fmt.Sprintf("%d秒", secs)
 }
 
 // 确保目录存在

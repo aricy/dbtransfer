@@ -293,13 +293,24 @@ func (m *PostgreSQLMigration) migrateTable(ctx context.Context, table config.Tab
 		}
 	}
 
-	// 获取总行数
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s", table.Name)
-	if table.Where != "" {
-		countQuery = fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", table.Name, table.Where)
+	// 获取总行数（优先使用 pg_class 统计信息，毫秒级；失败时回退到 COUNT(*)）
+	var estimateErr error
+	totalRows, estimateErr = m.estimateTableRows(table.Name)
+	if estimateErr != nil {
+		logrus.Warnf("统计信息估算失败: %v, 回退到 COUNT(*)", estimateErr)
+		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s", table.Name)
+		if err := m.source.QueryRow(countQuery).Scan(&totalRows); err != nil {
+			logrus.Warnf("COUNT(*) 也失败: %v, 不显示进度百分比", err)
+			totalRows = 0
+		}
 	}
-	if err := m.source.QueryRow(countQuery).Scan(&totalRows); err != nil {
-		return fmt.Errorf(i18n.Tr("获取总行数失败: %v", "Failed to get total row count: %v"), err)
+	if table.Where != "" {
+		// 有自定义 WHERE 条件时无法从统计信息估算，使用 COUNT(*) 获取精确值
+		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", table.Name, table.Where)
+		if err := m.source.QueryRow(countQuery).Scan(&totalRows); err != nil {
+			logrus.Warnf("获取过滤后总行数失败: %v, 不显示进度百分比", err)
+			totalRows = 0
+		}
 	}
 
 	// 初始化统计信息
@@ -808,4 +819,25 @@ func validateTransformExpression(expr string) error {
 	}
 
 	return nil
+}
+
+// estimateTableRows uses pg_class.reltuples for fast approximate row count.
+func (m *PostgreSQLMigration) estimateTableRows(tableName string) (int64, error) {
+	schema := m.config.Source.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	query := `SELECT reltuples::bigint FROM pg_class
+		JOIN pg_namespace n ON n.oid = pg_class.relnamespace
+		WHERE relname = $1 AND nspname = $2`
+	var count int64
+	err := m.source.QueryRow(query, tableName, schema).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	if count < 0 {
+		// reltuples = -1 means statistics never gathered, fall back to COUNT(*)
+		return 0, fmt.Errorf("pg_class statistics not available")
+	}
+	return count, nil
 }

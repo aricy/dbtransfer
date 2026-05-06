@@ -81,7 +81,8 @@ type CassandraMigration struct {
 	statsMutex         sync.RWMutex
 	maxRetries         int
 	retryDelay         time.Duration
-	lastCheckpointTime time.Time // 上次保存断点的时间
+	lastCheckpointTime time.Time
+	estimator          TotalRowEstimator
 }
 
 // TableInfo 缓存表的元数据，避免重复查询
@@ -164,6 +165,7 @@ func NewMigration(config *config.Config) (migration.Migration, error) {
 		maxRetries:         3,
 		retryDelay:         time.Second * 5,
 		lastCheckpointTime: time.Now(),
+		estimator:          NewSizeEstimatesEstimatorWithAuth(sourceSession, config.Source.Hosts, config.Source.Username, config.Source.Password),
 	}, nil
 }
 
@@ -178,22 +180,53 @@ func (m *CassandraMigration) Close() error {
 }
 
 func (m *CassandraMigration) Run(ctx context.Context) error {
-	// 输出全局配置信息
 	logrus.Infof(i18n.Tr("开始执行数据查询，读取页大小: %d, 写入批次: %d, 全局限速: %d 行/秒",
 		"Starting data query, read page size: %d, write batch: %d, global rate limit: %d rows/sec"),
 		m.config.Migration.BatchSize, m.config.Migration.WriteBatchSize, m.config.Migration.RateLimit)
 
-	// 依次迁移表
 	for _, table := range m.config.Source.Tables {
-		// 初始化表的统计信息
-		stats := migration.NewMigrationStats(0, m.config.Migration.ProgressInterval, table.Name)
+		// 获取预估总分区数
+		totalRows, _, err := m.estimator.EstimateTotalRows(m.config.Source.Keyspace, table.Name)
+		if err != nil {
+			logrus.Warnf("预估总分区数失败: %v", err)
+		} else {
+			logrus.Infof("表 %s 来自 system.size_estimates 的总分区数: %d", table.Name, totalRows)
+		}
+
+		avgPartSize := m.estimator.GetAvgPartitionSize()
+		rowsPerPart := 1.0
+		hasClustering, err := m.hasClusteringKeys(m.config.Source.Keyspace, table.Name)
+		if err != nil {
+			logrus.Warnf("检测 clustering key 失败: %v, 默认 rowsPerPart=1", err)
+		}
+		if hasClustering {
+			if avgPartSize > 0 {
+				avgRowSize, err := m.sampleAvgRowSize(m.config.Source.Keyspace, table.Name)
+				if err != nil {
+					logrus.Warnf("采样行大小失败: %v, 使用默认估算 100 bytes/行", err)
+					avgRowSize = 100
+				}
+				rowsPerPart = float64(avgPartSize) / float64(avgRowSize)
+				if rowsPerPart < 1 {
+					rowsPerPart = 1.0
+				}
+			}
+			logrus.Infof("表 %s 存在 clustering key, 估算每分区 %.1f 行 (平均分区大小: %d bytes, 采样行大小: %.0f bytes)", table.Name, rowsPerPart, avgPartSize, float64(avgPartSize)/rowsPerPart)
+		} else {
+			logrus.Infof("表 %s 无 clustering key, 分区数=行数", table.Name)
+		}
+
+		// 估算总行数
+		estimatedTotalRows := int64(float64(totalRows) * rowsPerPart)
+
+		stats := migration.NewMigrationStats(estimatedTotalRows, m.config.Migration.ProgressInterval, table.Name)
 		m.statsMutex.Lock()
 		m.statsMap[table.Name] = stats
 		m.statsMutex.Unlock()
 
 		stats.StartReporting(time.Duration(m.config.Migration.ProgressInterval) * time.Second)
 
-		err := m.migrateTable(ctx, table)
+		err = m.migrateTable(ctx, table)
 
 		m.statsMutex.Lock()
 		delete(m.statsMap, table.Name)
@@ -268,13 +301,10 @@ func (m *CassandraMigration) migrateTable(ctx context.Context, table config.Tabl
 		}
 		logrus.Infof(i18n.Tr("从断点恢复，剩余 %d 个范围", "Resuming from checkpoint, %d ranges remaining"), countIncompleteRanges(ranges))
 	} else {
-		// 初始化 Token Ranges
-		// 如果配置了自定义 WHERE 条件，只需要单个范围（因为不使用 token range 扫描）
 		if table.Where != "" {
 			ranges = []migration.TokenRange{{Start: 0, End: 0, Complete: false}}
 			logrus.Infof(i18n.Tr("使用自定义 WHERE 条件: %s", "Using custom WHERE condition: %s"), table.Where)
 		} else {
-			// 范围数量为 workers 的 4 倍，使数据分布更均匀
 			numWorkers := m.config.Migration.Workers
 			if numWorkers <= 0 {
 				numWorkers = 4
@@ -284,6 +314,9 @@ func (m *CassandraMigration) migrateTable(ctx context.Context, table config.Tabl
 			logrus.Infof(i18n.Tr("初始化 %d 个 Token 范围", "Initialized %d token ranges"), len(ranges))
 		}
 	}
+
+	// 按剩余范围比例调整估算总行数
+	m.adjustTotalByRemainingRanges(table.Name, ranges)
 
 	// 创建任务通道
 	rangeChan := make(chan migration.TokenRange, len(ranges))
@@ -422,6 +455,28 @@ func countIncompleteRanges(ranges []migration.TokenRange) int {
 		}
 	}
 	return count
+}
+
+// adjustTotalByRemainingRanges adjusts stats.TotalRows proportionally based on remaining ranges.
+func (m *CassandraMigration) adjustTotalByRemainingRanges(tableName string, ranges []migration.TokenRange) {
+	m.statsMutex.RLock()
+	stats := m.statsMap[tableName]
+	m.statsMutex.RUnlock()
+	if stats == nil {
+		return
+	}
+
+	totalRanges := len(ranges)
+	remainingRanges := countIncompleteRanges(ranges)
+	if totalRanges == 0 || remainingRanges == totalRanges {
+		return // no adjustment needed
+	}
+
+	adjusted := float64(stats.TotalRows) * float64(remainingRanges) / float64(totalRanges)
+	stats.Lock()
+	stats.TotalRows = int64(adjusted)
+	stats.Unlock()
+	logrus.Infof("按剩余范围调整估算: %d/%d 范围, 调整后估算行数: %d", remainingRanges, totalRanges, int64(adjusted))
 }
 
 func (m *CassandraMigration) migrateDependencies() error {
@@ -1676,4 +1731,188 @@ func (m *CassandraMigration) getTableInfo(tableName string) (*TableInfo, error) 
 		TableConfig:       tableConfig,
 		PartitionKeyNames: partitionKeyNames,
 	}, nil
+}
+
+// hasClusteringKeys checks if a table has any clustering columns.
+func (m *CassandraMigration) hasClusteringKeys(keyspace, tableName string) (bool, error) {
+	query := fmt.Sprintf(`
+		SELECT kind
+		FROM system_schema.columns
+		WHERE keyspace_name = '%s'
+		AND table_name = '%s'`,
+		keyspace, tableName)
+
+	iter := m.source.Query(query).Iter()
+	var kind string
+	for iter.Scan(&kind) {
+		if kind == "clustering" {
+			iter.Close()
+			return true, nil
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return false, fmt.Errorf("failed to check clustering keys: %w", err)
+	}
+	return false, nil
+}
+
+// sampleAvgRowSize samples up to 1000 rows and returns the estimated average row size in bytes.
+func (m *CassandraMigration) sampleAvgRowSize(keyspace, tableName string) (float64, error) {
+	query := fmt.Sprintf(`
+		SELECT column_name, type
+		FROM system_schema.columns
+		WHERE keyspace_name = '%s' AND table_name = '%s'`,
+		keyspace, tableName)
+
+	type colInfo struct {
+		name   string
+		goType reflect.Type
+	}
+	var cols []colInfo
+	iter := m.source.Query(query).Iter()
+	var colName, colType string
+	for iter.Scan(&colName, &colType) {
+		cols = append(cols, colInfo{name: colName, goType: m.getGoType(colType)})
+	}
+	if err := iter.Close(); err != nil {
+		return 0, fmt.Errorf("failed to get columns for sampling: %w", err)
+	}
+	if len(cols) == 0 {
+		return 0, fmt.Errorf("no columns found for table %s", tableName)
+	}
+
+	colNames := make([]string, len(cols))
+	for i, c := range cols {
+		colNames[i] = fmt.Sprintf("\"%s\"", c.name)
+	}
+	sampleQuery := fmt.Sprintf("SELECT %s FROM %s.%s LIMIT 1000",
+		strings.Join(colNames, ", "), keyspace, tableName)
+
+	values := make([]interface{}, len(cols))
+	for i, c := range cols {
+		values[i] = reflect.New(reflect.PtrTo(c.goType)).Interface()
+	}
+
+	sampleIter := m.source.Query(sampleQuery).Iter()
+	var totalSize int64
+	var rowCount int64
+	for sampleIter.Scan(values...) {
+		for i, valPtr := range values {
+			totalSize += estimateValueSize(valPtr, cols[i].goType)
+		}
+		rowCount++
+	}
+	if err := sampleIter.Close(); err != nil {
+		return 0, fmt.Errorf("sample query failed: %w", err)
+	}
+	if rowCount == 0 {
+		return 0, fmt.Errorf("table %s has no rows to sample", tableName)
+	}
+
+	return float64(totalSize) / float64(rowCount), nil
+}
+
+// estimateValueSize estimates the byte size of a deserialized value based on its Go type.
+func estimateValueSize(valPtr interface{}, goType reflect.Type) int64 {
+	ptrVal := reflect.ValueOf(valPtr)
+	if ptrVal.IsNil() || ptrVal.Elem().IsNil() {
+		return 0
+	}
+	val := ptrVal.Elem().Elem().Interface()
+
+	switch v := val.(type) {
+	case string:
+		return int64(len(v))
+	case int:
+		return 8
+	case int8:
+		return 1
+	case int16:
+		return 2
+	case int32:
+		return 4
+	case int64:
+		return 8
+	case float32:
+		return 4
+	case float64:
+		return 8
+	case bool:
+		return 1
+	case []byte:
+		return int64(len(v))
+	case gocql.UUID:
+		return 16
+	case time.Time:
+		return 8
+	case big.Int:
+		return int64(len(v.Bytes()))
+	case inf.Dec:
+		return 16
+	default:
+		rv := reflect.ValueOf(val)
+		switch rv.Kind() {
+		case reflect.Slice, reflect.Array:
+			var size int64
+			for i := 0; i < rv.Len(); i++ {
+				elem := rv.Index(i)
+				if elem.CanInterface() {
+					size += estimateSimpleSize(elem.Interface())
+				}
+			}
+			if size > 0 {
+				return size
+			}
+			return 100
+		case reflect.Map:
+			var size int64
+			for _, key := range rv.MapKeys() {
+				mv := rv.MapIndex(key)
+				if key.CanInterface() {
+					size += estimateSimpleSize(key.Interface())
+				}
+				if mv.CanInterface() {
+					size += estimateSimpleSize(mv.Interface())
+				}
+			}
+			if size > 0 {
+				return size
+			}
+			return 200
+		default:
+			s := fmt.Sprintf("%v", val)
+			return int64(len(s))
+		}
+	}
+}
+
+// estimateSimpleSize estimates size of a simple scalar value.
+func estimateSimpleSize(val interface{}) int64 {
+	switch v := val.(type) {
+	case string:
+		return int64(len(v))
+	case int, int64:
+		return 8
+	case int8:
+		return 1
+	case int16:
+		return 2
+	case int32:
+		return 4
+	case float32:
+		return 4
+	case float64:
+		return 8
+	case bool:
+		return 1
+	case []byte:
+		return int64(len(v))
+	case gocql.UUID:
+		return 16
+	case time.Time:
+		return 8
+	default:
+		s := fmt.Sprintf("%v", val)
+		return int64(len(s))
+	}
 }

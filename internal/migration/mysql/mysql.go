@@ -260,6 +260,26 @@ func (m *MySQLMigration) migrateTable(ctx context.Context, table config.TableMap
 		}
 	}
 
+	// 估算总行数（考虑 WHERE 条件和断点恢复）
+	if totalRows, err := m.estimateTotalRows(table.Name, table.Where); err == nil && totalRows > 0 {
+		if lastID > 0 {
+			// 从断点恢复，扣除已完成的行数
+			var completedRows int64
+			completedQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s <= ?",
+				table.Name, primaryKey)
+			if table.Where != "" {
+				completedQuery = fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE (%s) AND %s <= ?",
+					table.Name, table.Where, primaryKey)
+			}
+			if err := m.source.QueryRow(completedQuery, lastID).Scan(&completedRows); err == nil {
+				totalRows -= completedRows
+				logrus.Infof("从断点恢复，已完成 %d 行，剩余 %d 行", completedRows, totalRows)
+			}
+		}
+		stats.TotalRows = totalRows
+		logrus.Infof("表 %s 估算剩余行数: %d", table.Name, totalRows)
+	}
+
 	// 构建查询语句
 	var query string
 	if table.Where != "" {
@@ -748,4 +768,22 @@ func (m *MySQLMigration) getPrimaryKey(tableName string) (string, error) {
 	}
 
 	return primaryKey, nil
+}
+
+// estimateTotalRows returns an estimated row count using information_schema.
+func (m *MySQLMigration) estimateTotalRows(tableName, whereClause string) (int64, error) {
+	if whereClause != "" {
+		query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", tableName, whereClause)
+		var count int64
+		err := m.source.QueryRow(query).Scan(&count)
+		return count, err
+	}
+	query := `SELECT TABLE_ROWS FROM information_schema.TABLES
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`
+	var count int64
+	err := m.source.QueryRow(query, m.config.Source.Database, tableName).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }
